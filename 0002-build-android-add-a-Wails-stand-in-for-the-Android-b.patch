@@ -1,0 +1,1521 @@
+From e419f6669cc741bbdb9a050606ee0865c37ac9b5 Mon Sep 17 00:00:00 2001
+From: Joel Brower <joel.brower@gmail.com>
+Date: Sat, 3 Oct 2026 00:22:38 -0500
+Subject: [PATCH 2/6] build(android): add a Wails stand-in for the Android
+ build
+
+Wails v2 has no Android target. android/wailsshim is a drop-in module for
+github.com/wailsapp/wails/v2 that mirrors the v2.16 API the desktop app uses,
+so the app compiles unmodified. pkg/mobile carries calls, events and host
+requests (pickers, dialogs, URLs, clipboard) across the bridge, with the same
+argument and error conventions as Wails' own binding layer.
+
+On a desktop OS, wails.Run serves the frontend with the Android shim and the
+bridge over HTTP on the wails-dev port, as a browser harness for the exact
+code the phone runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016wzfhQtsFu3EKKkUkehQyh
+---
+ android/wailsshim/devhost.js                  |  43 ++
+ android/wailsshim/go.mod                      |  14 +
+ android/wailsshim/pkg/mobile/files.go         | 173 ++++++++
+ android/wailsshim/pkg/mobile/host.go          | 375 ++++++++++++++++++
+ android/wailsshim/pkg/mobile/host_test.go     | 186 +++++++++
+ .../pkg/options/assetserver/assetserver.go    |  15 +
+ android/wailsshim/pkg/options/linux/linux.go  |   8 +
+ android/wailsshim/pkg/options/mac/mac.go      |   7 +
+ android/wailsshim/pkg/options/options.go      |  82 ++++
+ .../wailsshim/pkg/options/windows/windows.go  |  14 +
+ android/wailsshim/pkg/runtime/runtime.go      | 280 +++++++++++++
+ android/wailsshim/wails.go                    | 204 ++++++++++
+ 12 files changed, 1401 insertions(+)
+ create mode 100644 android/wailsshim/devhost.js
+ create mode 100644 android/wailsshim/go.mod
+ create mode 100644 android/wailsshim/pkg/mobile/files.go
+ create mode 100644 android/wailsshim/pkg/mobile/host.go
+ create mode 100644 android/wailsshim/pkg/mobile/host_test.go
+ create mode 100644 android/wailsshim/pkg/options/assetserver/assetserver.go
+ create mode 100644 android/wailsshim/pkg/options/linux/linux.go
+ create mode 100644 android/wailsshim/pkg/options/mac/mac.go
+ create mode 100644 android/wailsshim/pkg/options/options.go
+ create mode 100644 android/wailsshim/pkg/options/windows/windows.go
+ create mode 100644 android/wailsshim/pkg/runtime/runtime.go
+ create mode 100644 android/wailsshim/wails.go
+
+diff --git a/android/wailsshim/devhost.js b/android/wailsshim/devhost.js
+new file mode 100644
+index 00000000..86995c15
+--- /dev/null
++++ b/android/wailsshim/devhost.js
+@@ -0,0 +1,43 @@
++// Browser dev harness only (see wails.go). Recreates window.STRHost, the
++// Android app's JavaScript interface, over HTTP, so android-shim.js and the
++// frontend run exactly as they do in the app. Never shipped in the APK.
++(function () {
++  'use strict';
++  function post(path, body) {
++    return fetch(path, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify(body),
++    });
++  }
++  // Captured before android-shim.js routes navigator.clipboard through this
++  // object, which would otherwise call back into itself.
++  var origWrite = navigator.clipboard && navigator.clipboard.writeText
++    ? navigator.clipboard.writeText.bind(navigator.clipboard) : null;
++  window.STRHost = {
++    call: function (id, method, argsJSON) {
++      post('/__str/call', { method: method, args: JSON.parse(argsJSON || '[]') })
++        .then(function (r) { return r.json(); })
++        .then(function (env) { window.__strReply(id, env); })
++        .catch(function (e) { window.__strReply(id, { ok: false, error: String(e) }); });
++    },
++    emit: function (name, dataJSON) {
++      post('/__str/emit', { name: name, data: JSON.parse(dataJSON || '[]') });
++    },
++    openURL: function (url) { window.open(url, '_blank', 'noopener'); },
++    clipboardSet: function (text) { if (origWrite) origWrite(text).catch(function () {}); },
++    clipboardGet: function () { return ''; },
++    quit: function () {},
++  };
++  (function pump() {
++    fetch('/__str/events')
++      .then(function (r) { return r.json(); })
++      .then(function (evs) {
++        for (var i = 0; i < evs.length; i++) {
++          if (window.__strEvent) window.__strEvent(evs[i]);
++        }
++        pump();
++      })
++      .catch(function () { setTimeout(pump, 2000); });
++  })();
++})();
+diff --git a/android/wailsshim/go.mod b/android/wailsshim/go.mod
+new file mode 100644
+index 00000000..56d6bb81
+--- /dev/null
++++ b/android/wailsshim/go.mod
+@@ -0,0 +1,14 @@
++// Android stand-in for github.com/wailsapp/wails/v2.
++//
++// Wails v2 has no Android target. The STR desktop app only touches a small,
++// well-defined part of it (wails.Run, the options structs, and the runtime
++// package's events, dialogs, window and clipboard calls), so the Android build
++// swaps the whole module for this one with a replace directive in
++// desktop-app/go.android.mod. The desktop builds never see it.
++//
++// The public API mirrors Wails v2.16 signature for signature, so the desktop
++// app compiles unmodified. Behind it, pkg/mobile carries every call over to the
++// Android host (android/app) instead of a desktop webview.
++module github.com/wailsapp/wails/v2
++
++go 1.22
+diff --git a/android/wailsshim/pkg/mobile/files.go b/android/wailsshim/pkg/mobile/files.go
+new file mode 100644
+index 00000000..e06badff
+--- /dev/null
++++ b/android/wailsshim/pkg/mobile/files.go
+@@ -0,0 +1,173 @@
++package mobile
++
++import (
++	"encoding/json"
++	"fmt"
++	"mime"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++)
++
++// Paths the host hands over at start.
++var (
++	cfgMu    sync.RWMutex
++	cacheDir string
++)
++
++// SetCacheDir tells the bridge where it may stage files.
++func SetCacheDir(dir string) {
++	cfgMu.Lock()
++	cacheDir = dir
++	cfgMu.Unlock()
++}
++
++func stagingDir(kind string) (string, error) {
++	cfgMu.RLock()
++	base := cacheDir
++	cfgMu.RUnlock()
++	if base == "" {
++		base = os.TempDir()
++	}
++	dir := filepath.Join(base, "bridge", kind, fmt.Sprintf("%d", time.Now().UnixNano()))
++	return dir, os.MkdirAll(dir, 0o700)
++}
++
++// ---- save ("export") ---------------------------------------------------------
++//
++// Wails' SaveFileDialog asks the user for a path and returns it; the caller
++// then writes the file. Android has no user-visible paths: the Storage Access
++// Framework hands out a content:// URI and the bytes are copied into it. So the
++// stand-in returns a private staging path straight away, the bound method
++// writes there as usual, and when the call returns flushExports asks the host
++// to show its "Save as" picker and copy the finished file to wherever the user
++// chooses. The user sees the picker a moment after the work is done instead of
++// before it, which is the only visible difference.
++
++type pendingExport struct {
++	path    string
++	name    string
++	title   string
++	mime    string
++	created time.Time
++}
++
++var (
++	expMu   sync.Mutex
++	exports []pendingExport
++)
++
++// StageExport reserves a staging path for a file the caller is about to write.
++func StageExport(defaultName, title string, patterns []string) (string, error) {
++	name := sanitizeName(defaultName)
++	if name == "" {
++		name = "export"
++		if len(patterns) > 0 {
++			if ext := strings.TrimPrefix(patterns[0], "*"); strings.HasPrefix(ext, ".") {
++				name += ext
++			}
++		}
++	}
++	dir, err := stagingDir("export")
++	if err != nil {
++		return "", err
++	}
++	p := filepath.Join(dir, name)
++	mt := mime.TypeByExtension(filepath.Ext(name))
++	if mt == "" {
++		mt = "application/octet-stream"
++	}
++	expMu.Lock()
++	exports = append(exports, pendingExport{path: p, name: name, title: title, mime: mt, created: time.Now()})
++	expMu.Unlock()
++	return p, nil
++}
++
++// flushExports hands every staged file that now exists to the host. Entries
++// that were never written are dropped after ten minutes.
++func flushExports() {
++	expMu.Lock()
++	var keep, ready []pendingExport
++	for _, e := range exports {
++		if fi, err := os.Stat(e.path); err == nil && fi.Size() > 0 {
++			ready = append(ready, e)
++		} else if time.Since(e.created) < 10*time.Minute {
++			keep = append(keep, e)
++		}
++	}
++	exports = keep
++	expMu.Unlock()
++	for _, e := range ready {
++		HostNotify("saveFile", map[string]any{
++			"path":  e.path,
++			"name":  e.name,
++			"title": e.title,
++			"mime":  e.mime,
++		})
++	}
++}
++
++// ---- open ("import") ---------------------------------------------------------
++
++// PickFile asks the host for a document and returns a private copy's path, or
++// "" when the user cancelled.
++func PickFile(title string, patterns []string) (string, error) {
++	var mimes []string
++	for _, p := range patterns {
++		for _, part := range strings.Split(p, ";") {
++			ext := strings.TrimPrefix(strings.TrimSpace(part), "*")
++			if ext == "" || ext == "." {
++				continue
++			}
++			if mt := mime.TypeByExtension(ext); mt != "" {
++				mimes = append(mimes, mt)
++			}
++		}
++	}
++	if len(mimes) == 0 {
++		mimes = []string{"*/*"}
++	}
++	// Files arrive from other apps with generic types often enough (a JSON
++	// backup shared from a mail app is "application/octet-stream") that the
++	// generic types are always allowed too; the caller validates content.
++	mimes = append(mimes, "application/octet-stream", "text/plain")
++	dir, err := stagingDir("import")
++	if err != nil {
++		return "", err
++	}
++	raw, err := HostRequest("openFile", map[string]any{
++		"title":  title,
++		"mimes":  mimes,
++		"target": dir,
++	}, 30*time.Minute)
++	if err != nil {
++		return "", err
++	}
++	var ans struct {
++		Path  string `json:"path"`
++		Error string `json:"error"`
++	}
++	if err := json.Unmarshal(raw, &ans); err != nil {
++		return "", err
++	}
++	if ans.Error != "" {
++		return "", fmt.Errorf("%s", ans.Error)
++	}
++	return ans.Path, nil
++}
++
++func sanitizeName(s string) string {
++	s = filepath.Base(strings.TrimSpace(s))
++	if s == "." || s == "/" {
++		return ""
++	}
++	return strings.Map(func(r rune) rune {
++		switch r {
++		case '/', '\\', ':', '*', '?', '"', '<', '>', '|', 0:
++			return '_'
++		}
++		return r
++	}, s)
++}
+diff --git a/android/wailsshim/pkg/mobile/host.go b/android/wailsshim/pkg/mobile/host.go
+new file mode 100644
+index 00000000..90e85ebb
+--- /dev/null
++++ b/android/wailsshim/pkg/mobile/host.go
+@@ -0,0 +1,375 @@
++// Package mobile is the Go half of the STR Android bridge.
++//
++// It is not part of upstream Wails. It lives inside the Wails stand-in module
++// (android/wailsshim) because the stand-in's runtime package has to reach it,
++// and the desktop app's Android entry point (desktop-app/mobile_android.go) has
++// to reach it too.
++//
++// Three channels cross the bridge:
++//
++//  1. Calls, frontend to Go. The WebView's window.go.main.App proxy sends a
++//     method name and a JSON array of arguments; Call decodes the arguments
++//     into the bound method's parameter types by reflection, exactly the way
++//     Wails' own binding layer does, and returns a JSON envelope.
++//  2. Events, Go to frontend. runtime.EventsEmit lands in a queue that the
++//     Android host drains with NextEvent and replays into window.runtime.
++//  3. Host requests, Go to Android. Things only the platform can do (a file
++//     picker, a dialog, opening a URL) are queued as events of kind "host";
++//     the calling goroutine blocks until the host answers with HostReply.
++package mobile
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"reflect"
++	"runtime/debug"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// Envelope is what Call returns, serialised as JSON.
++type Envelope struct {
++	OK     bool            `json:"ok"`
++	Result json.RawMessage `json:"result,omitempty"`
++	Error  string          `json:"error,omitempty"`
++}
++
++var (
++	bindMu  sync.RWMutex
++	bound   reflect.Value
++	methods map[string]reflect.Method
++
++	errType = reflect.TypeOf((*error)(nil)).Elem()
++)
++
++// Bind registers the object whose exported methods the frontend may call. The
++// desktop app passes its *App, the same value it hands to wails.Run's Bind.
++func Bind(obj any) {
++	v := reflect.ValueOf(obj)
++	t := v.Type()
++	m := make(map[string]reflect.Method, t.NumMethod())
++	for i := 0; i < t.NumMethod(); i++ {
++		meth := t.Method(i)
++		if meth.IsExported() {
++			m[meth.Name] = meth
++		}
++	}
++	bindMu.Lock()
++	bound, methods = v, m
++	bindMu.Unlock()
++}
++
++// Methods lists the bound method names, for diagnostics.
++func Methods() []string {
++	bindMu.RLock()
++	defer bindMu.RUnlock()
++	out := make([]string, 0, len(methods))
++	for k := range methods {
++		out = append(out, k)
++	}
++	return out
++}
++
++// Call invokes a bound method. argsJSON is a JSON array, one element per
++// parameter. The result follows Wails' conventions: no return value gives
++// null, a trailing error return becomes a rejected promise, anything else is
++// the resolved value.
++func Call(method, argsJSON string) (out []byte) {
++	defer func() {
++		if r := recover(); r != nil {
++			out = envelope(nil, fmt.Errorf("%s panicked: %v\n%s", method, r, debug.Stack()))
++		}
++		flushExports()
++	}()
++
++	bindMu.RLock()
++	meth, ok := methods[method]
++	recv := bound
++	bindMu.RUnlock()
++	if !ok {
++		return envelope(nil, fmt.Errorf("unknown method %q", method))
++	}
++
++	var raw []json.RawMessage
++	if s := strings.TrimSpace(argsJSON); s != "" && s != "null" {
++		if err := json.Unmarshal([]byte(s), &raw); err != nil {
++			return envelope(nil, fmt.Errorf("%s: arguments are not a JSON array: %w", method, err))
++		}
++	}
++	ft := meth.Type // includes the receiver at index 0
++	nParams := ft.NumIn() - 1
++	if ft.IsVariadic() {
++		return envelope(nil, fmt.Errorf("%s: variadic methods are not bindable", method))
++	}
++	if len(raw) != nParams {
++		return envelope(nil, fmt.Errorf("%s takes %d argument(s), got %d", method, nParams, len(raw)))
++	}
++	in := make([]reflect.Value, 0, nParams+1)
++	in = append(in, recv)
++	for i := 0; i < nParams; i++ {
++		pt := ft.In(i + 1)
++		pv := reflect.New(pt)
++		if len(raw[i]) > 0 && string(raw[i]) != "null" {
++			if err := json.Unmarshal(raw[i], pv.Interface()); err != nil {
++				return envelope(nil, fmt.Errorf("%s: argument %d: %w", method, i+1, err))
++			}
++		}
++		in = append(in, pv.Elem())
++	}
++
++	res := meth.Func.Call(in)
++	switch len(res) {
++	case 0:
++		return envelope(nil, nil)
++	case 1:
++		if ft.Out(0).Implements(errType) && ft.Out(0).Kind() == reflect.Interface {
++			return envelope(nil, asError(res[0]))
++		}
++		return envelope(res[0].Interface(), nil)
++	default:
++		last := res[len(res)-1]
++		if ft.Out(len(res)-1) == errType {
++			if err := asError(last); err != nil {
++				return envelope(nil, err)
++			}
++		}
++		return envelope(res[0].Interface(), nil)
++	}
++}
++
++func asError(v reflect.Value) error {
++	if !v.IsValid() || (v.Kind() == reflect.Interface && v.IsNil()) {
++		return nil
++	}
++	if err, ok := v.Interface().(error); ok {
++		return err
++	}
++	return nil
++}
++
++func envelope(result any, err error) []byte {
++	if err != nil {
++		b, _ := json.Marshal(Envelope{OK: false, Error: err.Error()})
++		return b
++	}
++	rb, merr := json.Marshal(result)
++	if merr != nil {
++		b, _ := json.Marshal(Envelope{OK: false, Error: "result could not be encoded: " + merr.Error()})
++		return b
++	}
++	b, _ := json.Marshal(Envelope{OK: true, Result: rb})
++	return b
++}
++
++// ---- events -----------------------------------------------------------------
++
++// Event is one item in the Go-to-host queue.
++type Event struct {
++	Kind string `json:"kind"`           // "event" or "host"
++	Name string `json:"name,omitempty"` // event name (kind "event")
++	Data []any  `json:"data,omitempty"` // event payload (kind "event")
++
++	ID   int64  `json:"id,omitempty"`   // request id (kind "host")
++	Op   string `json:"op,omitempty"`   // host operation (kind "host")
++	Args any    `json:"args,omitempty"` // host operation arguments
++}
++
++// Two queues. Frontend events can arrive in bursts (install progress) while
++// the WebView is paused in the background, so their queue is bounded and drops
++// the oldest event when full; a progress update superseded by a later one is
++// no loss. Host requests (a picker the user is waiting for) are never dropped
++// and never wait behind events: NextEvent always serves them first.
++var (
++	queue     = make(chan []byte, 2048)
++	hostQueue = make(chan []byte, 256)
++)
++
++// Emit queues a frontend event.
++func Emit(name string, data ...any) {
++	b, err := json.Marshal(Event{Kind: "event", Name: name, Data: data})
++	if err != nil {
++		b, _ = json.Marshal(Event{Kind: "event", Name: name})
++	}
++	for {
++		select {
++		case queue <- b:
++			return
++		default:
++		}
++		select { // full: discard the oldest event, then retry
++		case <-queue:
++		default:
++		}
++	}
++}
++
++func pushHost(b []byte) { hostQueue <- b }
++
++// NextEvent blocks up to timeout for the next queued item and returns it as
++// JSON, or nil when the timeout passed first. A timeout of zero polls.
++func NextEvent(timeout time.Duration) []byte {
++	select {
++	case b := <-hostQueue:
++		return b
++	default:
++	}
++	if timeout <= 0 {
++		select {
++		case b := <-hostQueue:
++			return b
++		case b := <-queue:
++			return b
++		default:
++			return nil
++		}
++	}
++	t := time.NewTimer(timeout)
++	defer t.Stop()
++	select {
++	case b := <-hostQueue:
++		return b
++	case b := <-queue:
++		return b
++	case <-t.C:
++		return nil
++	}
++}
++
++// ---- Go-side listeners (runtime.EventsOn from Go) ---------------------------
++
++type listener struct {
++	id   int64
++	cb   func(...any)
++	left int // -1 = unlimited
++}
++
++var (
++	lisMu     sync.Mutex
++	listeners = map[string][]*listener{}
++	lisSeq    int64
++)
++
++// On registers a Go-side listener for events the frontend emits. Returns the
++// cancel function, like runtime.EventsOn.
++func On(name string, cb func(...any), counter int) func() {
++	lisMu.Lock()
++	lisSeq++
++	l := &listener{id: lisSeq, cb: cb, left: counter}
++	listeners[name] = append(listeners[name], l)
++	lisMu.Unlock()
++	return func() {
++		lisMu.Lock()
++		defer lisMu.Unlock()
++		ls := listeners[name]
++		for i, x := range ls {
++			if x.id == l.id {
++				listeners[name] = append(ls[:i], ls[i+1:]...)
++				break
++			}
++		}
++	}
++}
++
++// Off removes every Go-side listener for the given names.
++func Off(names ...string) {
++	lisMu.Lock()
++	for _, n := range names {
++		delete(listeners, n)
++	}
++	lisMu.Unlock()
++}
++
++// OffAll removes every Go-side listener.
++func OffAll() {
++	lisMu.Lock()
++	listeners = map[string][]*listener{}
++	lisMu.Unlock()
++}
++
++// Dispatch delivers an event the frontend emitted (window.runtime.EventsEmit)
++// to Go-side listeners. Wails also echoes frontend-emitted events back to
++// frontend listeners; the JS shim does that half itself.
++func Dispatch(name string, dataJSON string) {
++	var data []any
++	_ = json.Unmarshal([]byte(dataJSON), &data)
++	lisMu.Lock()
++	ls := append([]*listener(nil), listeners[name]...)
++	var keep []*listener
++	for _, l := range listeners[name] {
++		if l.left > 0 {
++			l.left--
++			if l.left == 0 {
++				continue
++			}
++		}
++		keep = append(keep, l)
++	}
++	listeners[name] = keep
++	lisMu.Unlock()
++	for _, l := range ls {
++		go l.cb(data...)
++	}
++}
++
++// ---- host requests ----------------------------------------------------------
++
++var (
++	reqSeq  atomic.Int64
++	pendMu  sync.Mutex
++	pending = map[int64]chan json.RawMessage{}
++)
++
++// ErrHostUnavailable is returned when the host does not answer in time.
++var ErrHostUnavailable = errors.New("the Android host did not answer")
++
++// HostRequest asks the Android host to perform op and waits for its JSON
++// answer. Used for pickers and dialogs, so the wait is generous.
++func HostRequest(op string, args any, timeout time.Duration) (json.RawMessage, error) {
++	id := reqSeq.Add(1)
++	ch := make(chan json.RawMessage, 1)
++	pendMu.Lock()
++	pending[id] = ch
++	pendMu.Unlock()
++	defer func() {
++		pendMu.Lock()
++		delete(pending, id)
++		pendMu.Unlock()
++	}()
++	b, err := json.Marshal(Event{Kind: "host", ID: id, Op: op, Args: args})
++	if err != nil {
++		return nil, err
++	}
++	pushHost(b)
++	if timeout <= 0 {
++		return <-ch, nil
++	}
++	t := time.NewTimer(timeout)
++	defer t.Stop()
++	select {
++	case r := <-ch:
++		return r, nil
++	case <-t.C:
++		return nil, ErrHostUnavailable
++	}
++}
++
++// HostNotify sends a fire-and-forget host operation.
++func HostNotify(op string, args any) {
++	b, err := json.Marshal(Event{Kind: "host", Op: op, Args: args})
++	if err == nil {
++		pushHost(b)
++	}
++}
++
++// HostReply delivers the host's answer to a pending HostRequest.
++func HostReply(id int64, payload []byte) {
++	pendMu.Lock()
++	ch := pending[id]
++	pendMu.Unlock()
++	if ch != nil {
++		ch <- json.RawMessage(append([]byte(nil), payload...))
++	}
++}
+diff --git a/android/wailsshim/pkg/mobile/host_test.go b/android/wailsshim/pkg/mobile/host_test.go
+new file mode 100644
+index 00000000..f0a1e514
+--- /dev/null
++++ b/android/wailsshim/pkg/mobile/host_test.go
+@@ -0,0 +1,186 @@
++package mobile
++
++import (
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++type fake struct{ last string }
++
++type item struct {
++	Name string `json:"name"`
++	N    int    `json:"n"`
++}
++
++func (f *fake) NoReturn(s string)               { f.last = s }
++func (f *fake) Value() string                   { return "v" }
++func (f *fake) OnlyErr(fail bool) error         { return failIf(fail) }
++func (f *fake) Pair(n int) (int, error)         { return n * 2, nil }
++func (f *fake) PairErr() (string, error)        { return "", errors.New("boom") }
++func (f *fake) Struct(in item) (item, error)    { in.N++; return in, nil }
++func (f *fake) Slice(xs []string, b bool) []any { return []any{len(xs), b} }
++func (f *fake) Panics()                         { panic("kaputt") }
++
++func failIf(b bool) error {
++	if b {
++		return errors.New("failed")
++	}
++	return nil
++}
++
++func decode(t *testing.T, b []byte) Envelope {
++	t.Helper()
++	var e Envelope
++	if err := json.Unmarshal(b, &e); err != nil {
++		t.Fatalf("envelope %s: %v", b, err)
++	}
++	return e
++}
++
++func TestCallFollowsWailsConventions(t *testing.T) {
++	f := &fake{}
++	Bind(f)
++	cases := []struct {
++		method, args string
++		ok           bool
++		result       string
++		errSub       string
++	}{
++		{"NoReturn", `["x"]`, true, "null", ""},
++		{"Value", `[]`, true, `"v"`, ""},
++		{"Value", ``, true, `"v"`, ""},
++		{"OnlyErr", `[false]`, true, "null", ""},
++		{"OnlyErr", `[true]`, false, "", "failed"},
++		{"Pair", `[21]`, true, "42", ""},
++		{"PairErr", `[]`, false, "", "boom"},
++		{"Struct", `[{"name":"a","n":1}]`, true, `{"name":"a","n":2}`, ""},
++		{"Slice", `[["a","b"],true]`, true, `[2,true]`, ""},
++		{"Slice", `[null,false]`, true, `[0,false]`, ""},
++		{"Pair", `[]`, false, "", "takes 1 argument"},
++		{"Pair", `["x"]`, false, "", "argument 1"},
++		{"Missing", `[]`, false, "", "unknown method"},
++		{"Panics", `[]`, false, "", "kaputt"},
++	}
++	for _, c := range cases {
++		e := decode(t, Call(c.method, c.args))
++		if e.OK != c.ok {
++			t.Errorf("%s(%s): ok=%v want %v (%+v)", c.method, c.args, e.OK, c.ok, e)
++			continue
++		}
++		if c.ok && string(e.Result) != c.result {
++			t.Errorf("%s(%s): result %s want %s", c.method, c.args, e.Result, c.result)
++		}
++		if !c.ok && !contains(e.Error, c.errSub) {
++			t.Errorf("%s(%s): error %q lacks %q", c.method, c.args, e.Error, c.errSub)
++		}
++	}
++	if f.last != "x" {
++		t.Errorf("NoReturn did not run with its argument: %q", f.last)
++	}
++}
++
++func TestEventsQueueAndHostRequests(t *testing.T) {
++	drain()
++	Emit("progress", 1, "two")
++	var ev Event
++	if err := json.Unmarshal(NextEvent(time.Second), &ev); err != nil {
++		t.Fatal(err)
++	}
++	if ev.Kind != "event" || ev.Name != "progress" || len(ev.Data) != 2 {
++		t.Fatalf("unexpected event %+v", ev)
++	}
++	if NextEvent(10*time.Millisecond) != nil {
++		t.Fatal("queue should be empty")
++	}
++
++	done := make(chan json.RawMessage, 1)
++	go func() {
++		r, err := HostRequest("messageDialog", map[string]string{"title": "t"}, 5*time.Second)
++		if err != nil {
++			t.Error(err)
++		}
++		done <- r
++	}()
++	var req Event
++	if err := json.Unmarshal(NextEvent(2*time.Second), &req); err != nil {
++		t.Fatal(err)
++	}
++	if req.Kind != "host" || req.Op != "messageDialog" || req.ID == 0 {
++		t.Fatalf("unexpected host request %+v", req)
++	}
++	HostReply(req.ID, []byte(`{"button":"OK"}`))
++	if got := string(<-done); got != `{"button":"OK"}` {
++		t.Fatalf("reply %s", got)
++	}
++}
++
++func TestFloodDropsOldestEventsAndHostRequestsGoFirst(t *testing.T) {
++	drain()
++	for i := 0; i < cap(queue)+50; i++ {
++		Emit("flood", i)
++	}
++	HostNotify("openURL", map[string]string{"url": "https://example.com"})
++	var first Event
++	_ = json.Unmarshal(NextEvent(0), &first)
++	if first.Kind != "host" || first.Op != "openURL" {
++		t.Fatalf("host request did not jump the flood; first item %+v", first)
++	}
++	n := 0
++	for NextEvent(0) != nil {
++		n++
++	}
++	if n != cap(queue) {
++		t.Fatalf("expected the newest %d events to survive, got %d", cap(queue), n)
++	}
++}
++
++func TestExportIsHandedOverOnlyOnceWritten(t *testing.T) {
++	drain()
++	SetCacheDir(t.TempDir())
++	Bind(&fake{})
++	p, err := StageExport("../../evil:name.zip", "Save", []string{"*.zip"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if filepath.Base(p) != "evil_name.zip" {
++		t.Fatalf("name not sanitised: %s", p)
++	}
++	Call("Value", "[]") // nothing written yet: nothing handed over
++	if NextEvent(10*time.Millisecond) != nil {
++		t.Fatal("unwritten export was handed to the host")
++	}
++	if err := os.WriteFile(p, []byte("zip"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	Call("Value", "[]")
++	var ev Event
++	if err := json.Unmarshal(NextEvent(time.Second), &ev); err != nil {
++		t.Fatal(err)
++	}
++	args, _ := ev.Args.(map[string]any)
++	if ev.Op != "saveFile" || args["path"] != p || args["mime"] != "application/zip" {
++		t.Fatalf("unexpected handover %+v", ev)
++	}
++}
++
++func drain() {
++	for NextEvent(0) != nil {
++	}
++}
++
++func contains(s, sub string) bool {
++	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
++}
++
++func indexOf(s, sub string) int {
++	for i := 0; i+len(sub) <= len(s); i++ {
++		if s[i:i+len(sub)] == sub {
++			return i
++		}
++	}
++	return -1
++}
+diff --git a/android/wailsshim/pkg/options/assetserver/assetserver.go b/android/wailsshim/pkg/options/assetserver/assetserver.go
+new file mode 100644
+index 00000000..59ad8a3b
+--- /dev/null
++++ b/android/wailsshim/pkg/options/assetserver/assetserver.go
+@@ -0,0 +1,15 @@
++// Package assetserver is the Android stand-in for the Wails asset server
++// options. On Android the WebView loads the built frontend from the APK's
++// assets, so these values are unused.
++package assetserver
++
++import (
++	"io/fs"
++	"net/http"
++)
++
++type Options struct {
++	Assets     fs.FS
++	Handler    http.Handler
++	Middleware func(http.Handler) http.Handler
++}
+diff --git a/android/wailsshim/pkg/options/linux/linux.go b/android/wailsshim/pkg/options/linux/linux.go
+new file mode 100644
+index 00000000..64fdc85d
+--- /dev/null
++++ b/android/wailsshim/pkg/options/linux/linux.go
+@@ -0,0 +1,8 @@
++// Package linux is the Android stand-in for Wails' Linux options. Unused.
++package linux
++
++type Options struct {
++	Icon                []byte
++	WindowIsTranslucent bool
++	ProgramName         string
++}
+diff --git a/android/wailsshim/pkg/options/mac/mac.go b/android/wailsshim/pkg/options/mac/mac.go
+new file mode 100644
+index 00000000..71e82bb2
+--- /dev/null
++++ b/android/wailsshim/pkg/options/mac/mac.go
+@@ -0,0 +1,7 @@
++// Package mac is the Android stand-in for Wails' macOS options. Unused.
++package mac
++
++type Options struct {
++	WebviewIsTransparent bool
++	WindowIsTranslucent  bool
++}
+diff --git a/android/wailsshim/pkg/options/options.go b/android/wailsshim/pkg/options/options.go
+new file mode 100644
+index 00000000..401a9708
+--- /dev/null
++++ b/android/wailsshim/pkg/options/options.go
+@@ -0,0 +1,82 @@
++// Package options is the Android stand-in for github.com/wailsapp/wails/v2/pkg/options.
++//
++// It carries the fields desktop-app/main.go sets so that file compiles
++// unchanged. On Android main() is never run (the app is a shared library
++// driven by desktop-app/mobile_android.go), so none of these values are used.
++package options
++
++import (
++	"context"
++
++	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
++	"github.com/wailsapp/wails/v2/pkg/options/linux"
++	"github.com/wailsapp/wails/v2/pkg/options/mac"
++	"github.com/wailsapp/wails/v2/pkg/options/windows"
++)
++
++type RGBA struct {
++	R uint8 `json:"r"`
++	G uint8 `json:"g"`
++	B uint8 `json:"b"`
++	A uint8 `json:"a"`
++}
++
++func NewRGBA(r, g, b, a uint8) *RGBA { return &RGBA{R: r, G: g, B: b, A: a} }
++func NewRGB(r, g, b uint8) *RGBA     { return &RGBA{R: r, G: g, B: b, A: 255} }
++
++type SecondInstanceData struct {
++	Args             []string
++	WorkingDirectory string
++}
++
++type SingleInstanceLock struct {
++	UniqueId               string
++	OnSecondInstanceLaunch func(secondInstanceData SecondInstanceData)
++}
++
++type DragAndDrop struct {
++	EnableFileDrop     bool
++	DisableWebViewDrop bool
++	CSSDropProperty    string
++	CSSDropValue       string
++}
++
++type App struct {
++	Title                            string
++	Width                            int
++	Height                           int
++	DisableResize                    bool
++	Fullscreen                       bool
++	Frameless                        bool
++	MinWidth                         int
++	MinHeight                        int
++	MaxWidth                         int
++	MaxHeight                        int
++	StartHidden                      bool
++	HideWindowOnClose                bool
++	AlwaysOnTop                      bool
++	BackgroundColour                 *RGBA
++	AssetServer                      *assetserver.Options
++	Menu                             any
++	Logger                           any
++	LogLevel                         int
++	LogLevelProduction               int
++	OnStartup                        func(ctx context.Context)
++	OnDomReady                       func(ctx context.Context)
++	OnShutdown                       func(ctx context.Context)
++	OnBeforeClose                    func(ctx context.Context) (prevent bool)
++	Bind                             []interface{}
++	EnumBind                         []interface{}
++	WindowStartState                 int
++	ErrorFormatter                   func(error) any
++	CSSDragProperty                  string
++	CSSDragValue                     string
++	EnableDefaultContextMenu         bool
++	EnableFraudulentWebsiteDetection bool
++	SingleInstanceLock               *SingleInstanceLock
++	Windows                          *windows.Options
++	Mac                              *mac.Options
++	Linux                            *linux.Options
++	DragAndDrop                      *DragAndDrop
++	Debug                            any
++}
+diff --git a/android/wailsshim/pkg/options/windows/windows.go b/android/wailsshim/pkg/options/windows/windows.go
+new file mode 100644
+index 00000000..f4978746
+--- /dev/null
++++ b/android/wailsshim/pkg/options/windows/windows.go
+@@ -0,0 +1,14 @@
++// Package windows is the Android stand-in for Wails' Windows options. Unused.
++package windows
++
++type Options struct {
++	WebviewIsTransparent              bool
++	WindowIsTranslucent               bool
++	DisableWindowIcon                 bool
++	DisableFramelessWindowDecorations bool
++	WebviewUserDataPath               string
++	WebviewBrowserPath                string
++	ZoomFactor                        float64
++	IsZoomControlEnabled              bool
++	DisablePinchZoom                  bool
++}
+diff --git a/android/wailsshim/pkg/runtime/runtime.go b/android/wailsshim/pkg/runtime/runtime.go
+new file mode 100644
+index 00000000..9a6a90ec
+--- /dev/null
++++ b/android/wailsshim/pkg/runtime/runtime.go
+@@ -0,0 +1,280 @@
++// Package runtime is the Android stand-in for github.com/wailsapp/wails/v2/pkg/runtime.
++//
++// Signatures match Wails v2.16. The context argument is accepted and ignored:
++// there is one app and one WebView per process on Android, so there is nothing
++// for it to select.
++//
++// Mapping:
++//   - Events go to the WebView through pkg/mobile's queue.
++//   - Open dialogs use the system document picker; save dialogs stage the
++//     file and hand it to the system "Save as" picker afterwards.
++//   - Message dialogs become an Android AlertDialog.
++//   - BrowserOpenURL and the clipboard go to the platform.
++//   - Window and screen calls have no meaning for a full-screen activity and
++//     are no-ops; ScreenGetAll reports an error so size-fitting code skips.
++package runtime
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"log"
++	"runtime"
++	"time"
++
++	"github.com/wailsapp/wails/v2/pkg/mobile"
++)
++
++// ---- types (mirrors internal/frontend) --------------------------------------
++
++type FileFilter struct {
++	DisplayName string // Filter information EG: "Image Files (*.jpg, *.png)"
++	Pattern     string // semicolon separated list of extensions, EG: "*.jpg;*.png"
++}
++
++type OpenDialogOptions struct {
++	DefaultDirectory           string
++	DefaultFilename            string
++	Title                      string
++	Filters                    []FileFilter
++	ShowHiddenFiles            bool
++	CanCreateDirectories       bool
++	ResolvesAliases            bool
++	TreatPackagesAsDirectories bool
++}
++
++type SaveDialogOptions struct {
++	DefaultDirectory           string
++	DefaultFilename            string
++	Title                      string
++	Filters                    []FileFilter
++	ShowHiddenFiles            bool
++	CanCreateDirectories       bool
++	TreatPackagesAsDirectories bool
++}
++
++type DialogType string
++
++const (
++	InfoDialog     DialogType = "info"
++	WarningDialog  DialogType = "warning"
++	ErrorDialog    DialogType = "error"
++	QuestionDialog DialogType = "question"
++)
++
++type MessageDialogOptions struct {
++	Type          DialogType
++	Title         string
++	Message       string
++	Buttons       []string
++	DefaultButton string
++	CancelButton  string
++	Icon          []byte
++}
++
++type Screen struct {
++	IsCurrent    bool       `json:"isCurrent"`
++	IsPrimary    bool       `json:"isPrimary"`
++	Width        int        `json:"width"`
++	Height       int        `json:"height"`
++	Size         ScreenSize `json:"size"`
++	PhysicalSize ScreenSize `json:"physicalSize"`
++}
++
++type ScreenSize struct {
++	Width  int `json:"width"`
++	Height int `json:"height"`
++}
++
++type EnvironmentInfo struct {
++	BuildType string `json:"buildType"`
++	Platform  string `json:"platform"`
++	Arch      string `json:"arch"`
++}
++
++// ---- events -----------------------------------------------------------------
++
++func EventsEmit(_ context.Context, eventName string, optionalData ...interface{}) {
++	mobile.Emit(eventName, optionalData...)
++}
++
++func EventsOn(_ context.Context, eventName string, callback func(optionalData ...interface{})) func() {
++	return mobile.On(eventName, callback, -1)
++}
++
++func EventsOnce(_ context.Context, eventName string, callback func(optionalData ...interface{})) func() {
++	return mobile.On(eventName, callback, 1)
++}
++
++func EventsOnMultiple(_ context.Context, eventName string, callback func(optionalData ...interface{}), counter int) func() {
++	return mobile.On(eventName, callback, counter)
++}
++
++func EventsOff(_ context.Context, eventName string, additionalEventNames ...string) {
++	mobile.Off(append([]string{eventName}, additionalEventNames...)...)
++}
++
++func EventsOffAll(_ context.Context) { mobile.OffAll() }
++
++// ---- dialogs ----------------------------------------------------------------
++
++func patterns(fs []FileFilter) []string {
++	out := make([]string, 0, len(fs))
++	for _, f := range fs {
++		out = append(out, f.Pattern)
++	}
++	return out
++}
++
++func OpenFileDialog(_ context.Context, o OpenDialogOptions) (string, error) {
++	return mobile.PickFile(o.Title, patterns(o.Filters))
++}
++
++func OpenMultipleFilesDialog(ctx context.Context, o OpenDialogOptions) ([]string, error) {
++	p, err := OpenFileDialog(ctx, o)
++	if err != nil || p == "" {
++		return nil, err
++	}
++	return []string{p}, nil
++}
++
++func OpenDirectoryDialog(_ context.Context, _ OpenDialogOptions) (string, error) {
++	return "", errors.New("choosing a folder is not available on Android")
++}
++
++func SaveFileDialog(_ context.Context, o SaveDialogOptions) (string, error) {
++	return mobile.StageExport(o.DefaultFilename, o.Title, patterns(o.Filters))
++}
++
++func MessageDialog(_ context.Context, o MessageDialogOptions) (string, error) {
++	buttons := o.Buttons
++	if len(buttons) == 0 {
++		if o.Type == QuestionDialog {
++			buttons = []string{"Yes", "No"}
++		} else {
++			buttons = []string{"OK"}
++		}
++	}
++	raw, err := mobile.HostRequest("messageDialog", map[string]any{
++		"type":          string(o.Type),
++		"title":         o.Title,
++		"message":       o.Message,
++		"buttons":       buttons,
++		"defaultButton": o.DefaultButton,
++		"cancelButton":  o.CancelButton,
++	}, 30*time.Minute)
++	if err != nil {
++		return "", err
++	}
++	var ans struct {
++		Button string `json:"button"`
++	}
++	if err := json.Unmarshal(raw, &ans); err != nil {
++		return "", err
++	}
++	if ans.Button == "" {
++		if o.CancelButton != "" {
++			return o.CancelButton, nil
++		}
++		return buttons[len(buttons)-1], nil
++	}
++	return ans.Button, nil
++}
++
++func OnFileDrop(_ context.Context, _ func(x, y int, paths []string)) {}
++func OnFileDropOff(_ context.Context)                                {}
++
++// ---- browser and clipboard ---------------------------------------------------
++
++func BrowserOpenURL(_ context.Context, url string) {
++	mobile.HostNotify("openURL", map[string]any{"url": url})
++}
++
++func ClipboardSetText(_ context.Context, text string) error {
++	mobile.HostNotify("clipboardSet", map[string]any{"text": text})
++	return nil
++}
++
++func ClipboardGetText(_ context.Context) (string, error) {
++	raw, err := mobile.HostRequest("clipboardGet", nil, 10*time.Second)
++	if err != nil {
++		return "", err
++	}
++	var ans struct {
++		Text string `json:"text"`
++	}
++	err = json.Unmarshal(raw, &ans)
++	return ans.Text, err
++}
++
++// ---- app lifecycle ------------------------------------------------------------
++
++func Quit(_ context.Context) { mobile.HostNotify("quit", nil) }
++func Hide(_ context.Context) {}
++func Show(_ context.Context) {}
++
++func Environment(_ context.Context) EnvironmentInfo {
++	return EnvironmentInfo{BuildType: "production", Platform: runtime.GOOS, Arch: runtime.GOARCH}
++}
++
++// ---- screen and window: no meaning for a full-screen activity --------------------
++
++var errNoScreen = errors.New("screen information is not available on Android")
++
++func ScreenGetAll(_ context.Context) ([]Screen, error) { return nil, errNoScreen }
++
++func WindowSetTitle(_ context.Context, _ string)        {}
++func WindowFullscreen(_ context.Context)                {}
++func WindowUnfullscreen(_ context.Context)              {}
++func WindowCenter(_ context.Context)                    {}
++func WindowReload(_ context.Context)                    { mobile.HostNotify("reload", nil) }
++func WindowReloadApp(_ context.Context)                 { mobile.HostNotify("reload", nil) }
++func WindowSetSystemDefaultTheme(_ context.Context)     {}
++func WindowSetLightTheme(_ context.Context)             {}
++func WindowSetDarkTheme(_ context.Context)              {}
++func WindowShow(_ context.Context)                      {}
++func WindowHide(_ context.Context)                      {}
++func WindowSetSize(_ context.Context, _ int, _ int)     {}
++func WindowGetSize(_ context.Context) (int, int)        { return 0, 0 }
++func WindowSetMinSize(_ context.Context, _ int, _ int)  {}
++func WindowSetMaxSize(_ context.Context, _ int, _ int)  {}
++func WindowSetAlwaysOnTop(_ context.Context, _ bool)    {}
++func WindowSetPosition(_ context.Context, _ int, _ int) {}
++func WindowGetPosition(_ context.Context) (int, int)    { return 0, 0 }
++func WindowMaximise(_ context.Context)                  {}
++func WindowToggleMaximise(_ context.Context)            {}
++func WindowUnmaximise(_ context.Context)                {}
++func WindowMinimise(_ context.Context)                  {}
++func WindowUnminimise(_ context.Context)                {}
++func WindowIsFullscreen(_ context.Context) bool         { return true }
++func WindowIsMaximised(_ context.Context) bool          { return true }
++func WindowIsMinimised(_ context.Context) bool          { return false }
++func WindowIsNormal(_ context.Context) bool             { return false }
++func WindowExecJS(_ context.Context, js string) {
++	mobile.HostNotify("execJS", map[string]any{"js": js})
++}
++func WindowSetBackgroundColour(_ context.Context, _, _, _, _ uint8) {}
++func WindowPrint(_ context.Context)                                 {}
++
++// ---- logging: Wails' log functions go to the standard logger (logcat) ------------
++
++func LogPrint(_ context.Context, message string)   { log.Print(message) }
++func LogTrace(_ context.Context, message string)   { log.Print("TRACE " + message) }
++func LogDebug(_ context.Context, message string)   { log.Print("DEBUG " + message) }
++func LogInfo(_ context.Context, message string)    { log.Print("INFO " + message) }
++func LogWarning(_ context.Context, message string) { log.Print("WARN " + message) }
++func LogError(_ context.Context, message string)   { log.Print("ERROR " + message) }
++func LogFatal(_ context.Context, message string)   { log.Print("FATAL " + message) }
++
++func LogPrintf(ctx context.Context, f string, a ...interface{}) { LogPrint(ctx, fmt.Sprintf(f, a...)) }
++func LogTracef(ctx context.Context, f string, a ...interface{}) { LogTrace(ctx, fmt.Sprintf(f, a...)) }
++func LogDebugf(ctx context.Context, f string, a ...interface{}) { LogDebug(ctx, fmt.Sprintf(f, a...)) }
++func LogInfof(ctx context.Context, f string, a ...interface{})  { LogInfo(ctx, fmt.Sprintf(f, a...)) }
++func LogWarningf(ctx context.Context, f string, a ...interface{}) {
++	LogWarning(ctx, fmt.Sprintf(f, a...))
++}
++func LogErrorf(ctx context.Context, f string, a ...interface{}) { LogError(ctx, fmt.Sprintf(f, a...)) }
++func LogFatalf(ctx context.Context, f string, a ...interface{}) { LogFatal(ctx, fmt.Sprintf(f, a...)) }
++
++func ResetSignalHandlers() {}
+diff --git a/android/wailsshim/wails.go b/android/wailsshim/wails.go
+new file mode 100644
+index 00000000..afd39420
+--- /dev/null
++++ b/android/wailsshim/wails.go
+@@ -0,0 +1,204 @@
++// Package wails is the Android stand-in for github.com/wailsapp/wails/v2.
++//
++// On Android, Run is never reached: the app is built as a shared library whose
++// main() the platform never calls, and desktop-app/mobile_android.go starts
++// the app instead.
++//
++// On a desktop OS, Run turns the Android build of the core into a browser dev
++// harness. `go run -modfile=go.android.mod .` in desktop-app serves the
++// frontend with the Android shim at http://127.0.0.1:34115 and carries the
++// bridge over HTTP instead of JNI, so the exact code the phone runs can be
++// exercised and inspected in any browser, at phone size, with devtools. The
++// port is the one `wails dev` uses, which STR speaker agents already allow as
++// a CORS origin, so the harness works against real speakers too.
++package wails
++
++import (
++	"context"
++	_ "embed"
++	"encoding/json"
++	"errors"
++	"io"
++	"io/fs"
++	"log"
++	"net"
++	"net/http"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"time"
++
++	"github.com/wailsapp/wails/v2/pkg/mobile"
++	"github.com/wailsapp/wails/v2/pkg/options"
++)
++
++//go:embed devhost.js
++var devHostJS []byte
++
++// Run starts the browser dev harness (desktop OS only).
++func Run(o *options.App) error {
++	if runtime.GOOS == "android" {
++		return errors.New("wails.Run is not available on Android; the app is started by the Android host")
++	}
++	for _, b := range o.Bind {
++		mobile.Bind(b)
++	}
++	if dir, err := os.MkdirTemp("", "str-harness-"); err == nil {
++		mobile.SetCacheDir(dir)
++	}
++	ctx := context.Background()
++	if o.OnStartup != nil {
++		o.OnStartup(ctx)
++	}
++	go answerHostRequests()
++
++	web, err := webRoot(o)
++	if err != nil {
++		return err
++	}
++	shimDir := os.Getenv("STR_SHIM_DIR")
++	if shimDir == "" {
++		shimDir = filepath.Join("..", "android", "app", "src", "main", "js")
++	}
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("/__str/devhost.js", func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "text/javascript")
++		_, _ = w.Write(devHostJS)
++	})
++	mux.HandleFunc("/android-shim.js", func(w http.ResponseWriter, r *http.Request) {
++		http.ServeFile(w, r, filepath.Join(shimDir, "android-shim.js"))
++	})
++	mux.HandleFunc("/android.css", func(w http.ResponseWriter, r *http.Request) {
++		http.ServeFile(w, r, filepath.Join(shimDir, "android.css"))
++	})
++	mux.HandleFunc("/__str/call", func(w http.ResponseWriter, r *http.Request) {
++		var req struct {
++			Method string          `json:"method"`
++			Args   json.RawMessage `json:"args"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write(mobile.Call(req.Method, string(req.Args)))
++	})
++	mux.HandleFunc("/__str/emit", func(w http.ResponseWriter, r *http.Request) {
++		var req struct {
++			Name string          `json:"name"`
++			Data json.RawMessage `json:"data"`
++		}
++		_ = json.NewDecoder(r.Body).Decode(&req)
++		mobile.Dispatch(req.Name, string(req.Data))
++	})
++	mux.HandleFunc("/__str/events", func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write(append(append([]byte("["), drainEvents()...), ']'))
++	})
++	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		p := strings.TrimPrefix(r.URL.Path, "/")
++		if p == "" || p == "index.html" {
++			b, err := fs.ReadFile(web, "index.html")
++			if err != nil {
++				http.Error(w, "frontend not built: run `npm run build` in desktop-app/frontend", http.StatusNotFound)
++				return
++			}
++			s := strings.Replace(string(b), "</title>", "</title>\n"+
++				`    <script src="/__str/devhost.js"></script>`+"\n"+
++				`    <script src="/android-shim.js"></script>`+"\n"+
++				`    <link rel="stylesheet" href="/android.css"/>`, 1)
++			w.Header().Set("Content-Type", "text/html; charset=utf-8")
++			_, _ = io.WriteString(w, s)
++			return
++		}
++		http.FileServer(http.FS(web)).ServeHTTP(w, r)
++	})
++
++	addr := os.Getenv("STR_DEV_ADDR")
++	if addr == "" {
++		addr = "127.0.0.1:34115"
++	}
++	ln, err := net.Listen("tcp", addr)
++	if err != nil {
++		return err
++	}
++	log.Printf("STR Android dev harness: open http://%s/ (narrow the window or use device mode for phone size)", ln.Addr())
++	return http.Serve(ln, mux)
++}
++
++// webRoot is the built frontend: STR_WEB_DIR when set, else the embedded copy.
++func webRoot(o *options.App) (fs.FS, error) {
++	if d := os.Getenv("STR_WEB_DIR"); d != "" {
++		return os.DirFS(d), nil
++	}
++	if o.AssetServer == nil || o.AssetServer.Assets == nil {
++		return nil, errors.New("no frontend assets; set STR_WEB_DIR")
++	}
++	sub, err := fs.Sub(o.AssetServer.Assets, "frontend/dist")
++	if err != nil {
++		return o.AssetServer.Assets, nil
++	}
++	return sub, nil
++}
++
++// drainEvents long-polls the queue: waits up to 25 s for the first item, then
++// takes whatever else is already queued. Host requests are answered by
++// answerHostRequests and never reach the page.
++func drainEvents() []byte {
++	var out []byte
++	first := true
++	for {
++		wait := time.Duration(0)
++		if first {
++			wait = 25 * time.Second
++		}
++		b := mobile.NextEvent(wait)
++		if b == nil {
++			return out
++		}
++		first = false
++		if handledAsHost(b) {
++			continue
++		}
++		if len(out) > 0 {
++			out = append(out, ',')
++		}
++		out = append(out, b...)
++	}
++}
++
++// Host requests in the harness. There is no platform to ask, so the answers
++// are the "user cancelled" ones, and the request is logged.
++var hostQueue = make(chan mobile.Event, 64)
++
++func handledAsHost(b []byte) bool {
++	var ev mobile.Event
++	if json.Unmarshal(b, &ev) != nil || ev.Kind != "host" {
++		return false
++	}
++	hostQueue <- ev
++	return true
++}
++
++func answerHostRequests() {
++	for ev := range hostQueue {
++		args, _ := json.Marshal(ev.Args)
++		log.Printf("harness: host request %q %s", ev.Op, args)
++		if ev.ID == 0 {
++			continue
++		}
++		var reply any = map[string]string{}
++		switch ev.Op {
++		case "openFile":
++			reply = map[string]string{"path": ""}
++		case "messageDialog":
++			reply = map[string]string{"button": ""}
++		case "clipboardGet":
++			reply = map[string]string{"text": ""}
++		}
++		b, _ := json.Marshal(reply)
++		mobile.HostReply(ev.ID, b)
++	}
++}
+-- 
+2.43.0
+

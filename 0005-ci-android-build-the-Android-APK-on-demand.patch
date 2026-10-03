@@ -1,0 +1,99 @@
+From ae2ddd6645583d163baaccec61d8e20dd7f2c993 Mon Sep 17 00:00:00 2001
+From: Joel Brower <joel.brower@gmail.com>
+Date: Sat, 3 Oct 2026 07:02:52 -0500
+Subject: [PATCH 5/6] ci(android): build the Android APK on demand
+
+A manual workflow that runs android/build.sh on a GitHub runner, which ships
+the Android SDK and NDK, and uploads the APK with its checksum.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016wzfhQtsFu3EKKkUkehQyh
+---
+ .github/workflows/android.yml | 75 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+ create mode 100644 .github/workflows/android.yml
+
+diff --git a/.github/workflows/android.yml b/.github/workflows/android.yml
+new file mode 100644
+index 00000000..0e75150a
+--- /dev/null
++++ b/.github/workflows/android.yml
+@@ -0,0 +1,75 @@
++name: android
++
++# Builds the Android app (android/README.md) and uploads the APK as a workflow
++# artifact. Manual only for now: the Android app is not part of a release yet.
++#
++#   gh workflow run android.yml            # then: gh run download -n STR-Android
++#
++# GitHub's Ubuntu runners ship the Android SDK and NDK, so the only thing
++# fetched here is Gradle itself, pinned to the version the project is tested
++# with.
++on:
++  workflow_dispatch:
++    inputs:
++      engine:
++        description: 'Embed the go-librespot Spotify engine (needed to restore Spotify after a speaker update)'
++        required: false
++        type: boolean
++        default: true
++
++permissions:
++  contents: read
++
++jobs:
++  apk:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 45
++    env:
++      GRADLE_VERSION: 8.14.3
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          fetch-depth: 0 # git describe stamps the app and the embedded agent
++
++      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
++        with:
++          go-version-file: go.mod
++          cache-dependency-path: |
++            go.sum
++            desktop-app/go.android.sum
++
++      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
++        with:
++          node-version: '22'
++          cache: npm
++          cache-dependency-path: desktop-app/frontend/package-lock.json
++
++      - name: Set up Java 17
++        run: echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
++
++      - name: Fetch Gradle
++        run: |
++          curl -fsSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
++          unzip -q /tmp/gradle.zip -d /tmp
++          echo "GRADLE=/tmp/gradle-${GRADLE_VERSION}/bin/gradle" >> "$GITHUB_ENV"
++
++      - name: Build
++        env:
++          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
++          WITH_ENGINE: ${{ inputs.engine && '1' || '0' }}
++          GH_TOKEN: ${{ github.token }}
++        run: android/build.sh
++
++      - name: Name the APK
++        run: |
++          v="$(git describe --tags --always --dirty)"
++          mkdir -p out
++          cp android/app/build/outputs/apk/release/app-release.apk "out/STR-Android-${v}.apk"
++          (cd out && sha256sum ./*.apk > SHA256SUMS)
++          ls -la out
++
++      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: STR-Android
++          path: out/
++          if-no-files-found: error
+-- 
+2.43.0
+

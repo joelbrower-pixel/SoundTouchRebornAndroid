@@ -1,0 +1,2881 @@
+From a6f0a3370b3f0beef34165bb3c55954e7437eafe Mon Sep 17 00:00:00 2001
+From: Joel Brower <joel.brower@gmail.com>
+Date: Sat, 3 Oct 2026 00:22:38 -0500
+Subject: [PATCH 4/6] feat(android): ST Reborn for Android phones and tablets
+
+The desktop app's Go core and frontend, unchanged, in an Android app: speaker
+discovery, radio, presets, library, multi-room, Spotify, speaker settings,
+network install and speaker updates. The USB-stick route and the desktop
+self-updater are hidden, since a phone can do neither.
+
+The page is served from https://wails.localhost, the origin agents already
+allow, so no agent change is needed. Android-specific fixes: a net-package
+overlay for interface enumeration and DNS on Android 11+, a multicast lock
+for discovery, binding to Wi-Fi so a speaker's setup access point is
+reachable, and the system pickers for backup and diagnostic files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016wzfhQtsFu3EKKkUkehQyh
+---
+ android/.gitignore                            |   9 +
+ android/README.md                             | 124 ++++++
+ android/app/build.gradle                      |  77 ++++
+ android/app/src/main/AndroidManifest.xml      |  34 ++
+ .../java/de/streborn/android/GoBridge.java    |  40 ++
+ .../java/de/streborn/android/HostBridge.java  | 383 +++++++++++++++++
+ .../de/streborn/android/MainActivity.java     | 400 ++++++++++++++++++
+ android/app/src/main/js/android-shim.js       | 210 +++++++++
+ android/app/src/main/js/android.css           |  66 +++
+ .../ic_launcher_foreground.png                | Bin 0 -> 16474 bytes
+ .../res/mipmap-anydpi-v26/ic_launcher.xml     |   5 +
+ .../src/main/res/mipmap-hdpi/ic_launcher.png  | Bin 0 -> 3229 bytes
+ .../src/main/res/mipmap-mdpi/ic_launcher.png  | Bin 0 -> 2051 bytes
+ .../src/main/res/mipmap-xhdpi/ic_launcher.png | Bin 0 -> 4743 bytes
+ .../main/res/mipmap-xxhdpi/ic_launcher.png    | Bin 0 -> 7350 bytes
+ .../main/res/mipmap-xxxhdpi/ic_launcher.png   | Bin 0 -> 9690 bytes
+ .../app/src/main/res/values-de/strings.xml    |   6 +
+ android/app/src/main/res/values/colors.xml    |   5 +
+ android/app/src/main/res/values/strings.xml   |   7 +
+ android/app/src/main/res/values/themes.xml    |   9 +
+ .../main/res/xml/network_security_config.xml  |  11 +
+ android/build.gradle                          |   3 +
+ android/build.sh                              | 182 ++++++++
+ .../goport/overlay/interface_android_str.go   | 217 ++++++++++
+ android/gradle.properties                     |   3 +
+ android/settings.gradle                       |  16 +
+ 26 files changed, 1807 insertions(+)
+ create mode 100644 android/.gitignore
+ create mode 100644 android/README.md
+ create mode 100644 android/app/build.gradle
+ create mode 100644 android/app/src/main/AndroidManifest.xml
+ create mode 100644 android/app/src/main/java/de/streborn/android/GoBridge.java
+ create mode 100644 android/app/src/main/java/de/streborn/android/HostBridge.java
+ create mode 100644 android/app/src/main/java/de/streborn/android/MainActivity.java
+ create mode 100644 android/app/src/main/js/android-shim.js
+ create mode 100644 android/app/src/main/js/android.css
+ create mode 100644 android/app/src/main/res/drawable-xxxhdpi/ic_launcher_foreground.png
+ create mode 100644 android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+ create mode 100644 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+ create mode 100644 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+ create mode 100644 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+ create mode 100644 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+ create mode 100644 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+ create mode 100644 android/app/src/main/res/values-de/strings.xml
+ create mode 100644 android/app/src/main/res/values/colors.xml
+ create mode 100644 android/app/src/main/res/values/strings.xml
+ create mode 100644 android/app/src/main/res/values/themes.xml
+ create mode 100644 android/app/src/main/res/xml/network_security_config.xml
+ create mode 100644 android/build.gradle
+ create mode 100755 android/build.sh
+ create mode 100644 android/goport/overlay/interface_android_str.go
+ create mode 100644 android/gradle.properties
+ create mode 100644 android/settings.gradle
+
+diff --git a/android/.gitignore b/android/.gitignore
+new file mode 100644
+index 00000000..0dc736d0
+--- /dev/null
++++ b/android/.gitignore
+@@ -0,0 +1,9 @@
++# Gradle and build outputs
++/.gradle/
++/build/
++/app/build/
++/local.properties
++/.idea/
++*.iml
++*.apk
++*.aab
+diff --git a/android/README.md b/android/README.md
+new file mode 100644
+index 00000000..7030b969
+--- /dev/null
++++ b/android/README.md
+@@ -0,0 +1,124 @@
++# ST Reborn for Android
++
++The STR desktop app, running on an Android phone or tablet: the same Go core,
++the same frontend, the same features apart from the few that need a computer.
++
++STR is an unofficial, community-built project. It is not affiliated with,
++endorsed by, or authorized by Bose. "Bose" and "SoundTouch" are trademarks of
++Bose Corporation.
++
++## How it works
++
++Wails, which hosts the desktop app, has no Android target. But the desktop
++app talks to Wails in only two places: on the Go side through `wails.Run` and
++the `runtime` package (events, file dialogs, window calls), and on the
++frontend side through the generated `window.go.main.App.*` bindings and
++`window.runtime`. The port replaces Wails at exactly those two seams and
++nothing else.
++
++```
++ ┌──────────────── Android app (android/app) ─────────────────┐
++ │ WebView  https://wails.localhost/  (unchanged frontend)    │
++ │   android-shim.js: window.go.main.App  +  window.runtime   │
++ │        │ STRHost (JavascriptInterface)        ▲ events      │
++ │ HostBridge.java ── pickers, dialogs, URLs, clipboard        │
++ │        │ JNI (UTF-8 byte arrays)              │             │
++ │ libstr.so = desktop-app built with -buildmode=c-shared      │
++ │   mobile_android.go / mobile_jni.c   (entry points)         │
++ │   android/wailsshim  (stands in for github.com/wailsapp/... │
++ │                       wails/v2 via go.android.mod)          │
++ └─────────────────────────────────────────────────────────────┘
++```
++
++* **Go side.** `desktop-app/go.android.mod` is `go.mod` plus one `replace`
++  that points `github.com/wailsapp/wails/v2` at `android/wailsshim`. The
++  stand-in mirrors the Wails v2.16 API signature for signature, so the
++  desktop app compiles unmodified. Behind it, `pkg/mobile` dispatches bound
++  calls by reflection (the same argument and error conventions as Wails),
++  queues events for the WebView, and turns dialogs into requests the Android
++  host answers.
++* **Frontend side.** The build copies the unchanged frontend into the APK and
++  loads `android-shim.js` ahead of it. The shim recreates `window.go` (as a
++  Proxy, so new bindings need no change) and `window.runtime`.
++  `android.css` adds a few phone-specific corrections, all scoped to
++  `html.platform-android`.
++* **Origin.** The page is served from `https://wails.localhost`, which is the
++  origin Wails uses on Windows. Every speaker agent already allows it in
++  `allowedCORSOrigins`, so the frontend's direct speaker requests work against
++  agents in the field, with no agent change and no loosening of that list.
++
++The only change to an existing file is `desktop-app/crashlog_unix.go`, which
++used `syscall.Dup2`. That call does not exist on arm64 Linux, so the desktop
++app did not compile for an ARM Linux desktop either. It now uses
++`unix.Dup2` from `golang.org/x/sys`.
++
++## Android-specific behavior
++
++| Topic | What the port does |
++|---|---|
++| Speaker discovery | Holds a Wi-Fi `MulticastLock` so mDNS and SSDP packets reach the app. |
++| Network interfaces | Android 11+ forbids the netlink calls behind `net.Interfaces()` (golang/go#40569). The build patches the standard library's `net` package with `go build -overlay` (`goport/overlay`), adding a bind-free `RTM_GETADDR` + `ioctl` fallback. Every caller, including zeroconf, works unchanged. |
++| DNS | Android has no `/etc/resolv.conf`, so resolvers pinned to the pure-Go path (the update client's) would query `127.0.0.1`. The host writes the current network's DNS servers to a private `resolv.conf` and the overlay points Go at it. |
++| Speaker setup AP | While Wi-Fi is connected the process is bound to it. A new speaker's own access point has no internet, so Android would otherwise send the core's traffic over mobile data. |
++| Save / open file | Wails "save to path" becomes: the method writes to a private staging file, and when the call returns the system "Save as" picker copies it to wherever the user chooses. "Open" uses the system picker and hands Go a private copy. |
++| Closing mid-update | Back asks the core first (the desktop `OnBeforeClose`), which offers to stay while an install or update runs. The screen is kept on while one runs. |
++| App self-update | Hidden: the desktop updater has no Android build to fetch. Speaker agent updates are unaffected. |
++| USB stick | Hidden: a phone app cannot see or format USB drives. The network install, the default route, is unchanged. |
++
++## Building
++
++Requirements: Go (the version in `go.mod`), Node and npm, and the Android SDK
++and NDK. Android Studio installs the SDK and NDK (SDK Manager > SDK Tools >
++NDK).
++
++```sh
++android/build.sh                   # native library, assets, then the APK
++WITH_ENGINE=1 android/build.sh     # also embed the go-librespot engine
++SKIP_GRADLE=1 android/build.sh     # stop before Gradle (then open android/ in Android Studio)
++ABIS=arm64-v8a android/build.sh    # a single ABI, for faster iteration
++```
++
++Like `make wails-build`, the script stamps the app and its embedded speaker
++agent with the same `git describe` version, so the OTA comparison stays
++consistent. Nothing tracked is modified: the agent and engine reach their
++`go:embed` slots through the same overlay, and the frontend is built outside
++`frontend/dist`.
++
++Release signing: set `STR_KEYSTORE`, `STR_KEYSTORE_PASSWORD`, `STR_KEY_ALIAS`
++and `STR_KEY_PASSWORD`. Without them the release APK is signed with the debug
++key. That is fine for testing but not for distribution.
++
++## Trying the Android build in a browser
++
++On a desktop OS the stand-in's `wails.Run` serves the frontend with the
++Android shim and carries the bridge over HTTP:
++
++```sh
++cd desktop-app/frontend && npm run build && cd ..
++go run -modfile=go.android.mod .   # then open http://127.0.0.1:34115/
++```
++
++This runs the exact Go code the phone runs and is useful with devtools in
++device mode. Port 34115 is the `wails dev` port, which agents already allow,
++so it works against real speakers too.
++
++## Tests
++
++* `cd android/wailsshim && go test -race ./...` covers the dispatcher
++  (Wails return and error conventions, argument decoding, panics), the event
++  and host-request queues, and the export handover.
++* The JNI layer and the net overlay were checked on a Linux host by building
++  the same sources under a test tag and driving them from a plain JVM and a
++  small Go program. See the PR description.
++
++## Open items
++
++* Verified on real hardware: not yet. The bridge, overlay and UI were
++  exercised against the real core, but no APK has run on a phone against a
++  speaker.
++* Newer Android versions are adding a runtime permission for local-network
++  access. `targetSdk` stays at 35 until that is handled.
++* App updates: none yet (sideloaded APK). A Play Store or F-Droid listing,
++  or an in-app APK update, is a separate decision.
++* The application ID `de.streborn.android` follows the desktop's
++  `de.st-reborn.desktop` naming and is the maintainer's to change.
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+new file mode 100644
+index 00000000..c2234be3
+--- /dev/null
++++ b/android/app/build.gradle
+@@ -0,0 +1,77 @@
++plugins {
++    id 'com.android.application'
++}
++
++// The version comes from the same `git describe` the desktop build stamps into
++// the app and its embedded speaker agent (see Makefile), so the Android app and
++// the agent it installs always agree on what "current" is.
++def strVersion = (project.findProperty('strVersion') ?: 'dev').toString()
++def strVersionCode = (project.findProperty('strVersionCode') ?: '1').toString().toInteger()
++
++android {
++    namespace 'de.streborn.android'
++    compileSdk 36
++
++    defaultConfig {
++        applicationId 'de.streborn.android'
++        minSdk 26
++        targetSdk 35
++        versionCode strVersionCode
++        versionName strVersion.replaceFirst('^v', '')
++    }
++
++    buildFeatures {
++        buildConfig true
++    }
++
++    signingConfigs {
++        // Release signing is supplied from outside the repo (see android/README.md).
++        release {
++            def ks = System.getenv('STR_KEYSTORE')
++            if (ks) {
++                storeFile file(ks)
++                storePassword System.getenv('STR_KEYSTORE_PASSWORD')
++                keyAlias System.getenv('STR_KEY_ALIAS')
++                keyPassword System.getenv('STR_KEY_PASSWORD')
++            }
++        }
++    }
++
++    buildTypes {
++        release {
++            minifyEnabled false
++            if (System.getenv('STR_KEYSTORE')) {
++                signingConfig signingConfigs.release
++            } else {
++                // No release key configured: sign with the debug key so the
++                // APK installs. Fine for testing, not for distribution.
++                signingConfig signingConfigs.debug
++            }
++        }
++    }
++
++    compileOptions {
++        sourceCompatibility JavaVersion.VERSION_17
++        targetCompatibility JavaVersion.VERSION_17
++    }
++
++    packaging {
++        jniLibs {
++            // libstr.so is Go; nothing to gain from extracting it.
++            useLegacyPackaging false
++        }
++    }
++
++    // Filled by android/build.sh: jniLibs/<abi>/libstr.so and assets/web/.
++    sourceSets {
++        main {
++            jniLibs.srcDirs = ['build/generated/str/jniLibs']
++            assets.srcDirs = ['build/generated/str/assets']
++        }
++    }
++}
++
++dependencies {
++    implementation 'androidx.webkit:webkit:1.14.0'
++    implementation 'androidx.annotation:annotation:1.9.1'
++}
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+new file mode 100644
+index 00000000..0e44a208
+--- /dev/null
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -0,0 +1,34 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android">
++
++    <uses-permission android:name="android.permission.INTERNET" />
++    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
++    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
++    <!-- mDNS and SSDP discovery of speakers and media servers. -->
++    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
++
++    <application
++        android:allowBackup="true"
++        android:icon="@mipmap/ic_launcher"
++        android:label="@string/app_name"
++        android:networkSecurityConfig="@xml/network_security_config"
++        android:supportsRtl="true"
++        android:theme="@style/Theme.STR"
++        android:usesCleartextTraffic="true">
++
++        <!-- configChanges: the page is a single responsive document holding live
++             state (open dialogs, an install in progress); recreating the
++             activity on rotation would reload it for nothing. -->
++        <activity
++            android:name=".MainActivity"
++            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density"
++            android:exported="true"
++            android:launchMode="singleTask"
++            android:windowSoftInputMode="adjustResize">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++    </application>
++</manifest>
+diff --git a/android/app/src/main/java/de/streborn/android/GoBridge.java b/android/app/src/main/java/de/streborn/android/GoBridge.java
+new file mode 100644
+index 00000000..81889a39
+--- /dev/null
++++ b/android/app/src/main/java/de/streborn/android/GoBridge.java
+@@ -0,0 +1,40 @@
++package de.streborn.android;
++
++import java.nio.charset.StandardCharsets;
++
++/**
++ * JNI surface of libstr.so, the STR desktop app's Go backend built as a shared
++ * library (desktop-app/mobile_android.go, desktop-app/mobile_jni.c).
++ *
++ * <p>Strings cross as UTF-8 byte arrays rather than {@code String}, because JNI's
++ * string functions use "modified UTF-8", which Go would read as invalid for any
++ * character outside the BMP (emoji in station names).
++ */
++public final class GoBridge {
++    private GoBridge() {}
++
++    static native void start(byte[] configJson);
++
++    static native byte[] call(byte[] method, byte[] argsJson);
++
++    /** Next queued event or host request as JSON, or null after the timeout. */
++    static native byte[] nextEvent(int timeoutMs);
++
++    static native void hostReply(long id, byte[] payloadJson);
++
++    static native void emit(byte[] name, byte[] dataJson);
++
++    /** True when leaving now should be refused (an update is running and the user chose to stay). */
++    static native boolean beforeClose();
++
++    /** True while an install or update runs. */
++    static native boolean busy();
++
++    static byte[] utf8(String s) {
++        return (s == null ? "" : s).getBytes(StandardCharsets.UTF_8);
++    }
++
++    static String str(byte[] b) {
++        return b == null ? null : new String(b, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/android/app/src/main/java/de/streborn/android/HostBridge.java b/android/app/src/main/java/de/streborn/android/HostBridge.java
+new file mode 100644
+index 00000000..20afe18b
+--- /dev/null
++++ b/android/app/src/main/java/de/streborn/android/HostBridge.java
+@@ -0,0 +1,383 @@
++package de.streborn.android;
++
++import android.app.Activity;
++import android.app.AlertDialog;
++import android.content.ActivityNotFoundException;
++import android.content.ClipData;
++import android.content.ClipboardManager;
++import android.content.Context;
++import android.content.Intent;
++import android.database.Cursor;
++import android.net.Uri;
++import android.os.Handler;
++import android.os.Looper;
++import android.provider.OpenableColumns;
++import android.util.Log;
++import android.webkit.JavascriptInterface;
++import android.webkit.WebView;
++import android.widget.Toast;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
++/**
++ * Both directions of the WebView-to-Go bridge.
++ *
++ * <ul>
++ *   <li>Exposed to JavaScript as {@code window.STRHost}; android-shim.js builds
++ *       {@code window.go} and {@code window.runtime} on top of it.
++ *   <li>Runs the event pump that drains Go's queue: frontend events are replayed
++ *       into the page, host requests (pickers, dialogs, URLs, clipboard) are
++ *       carried out here and answered with {@link GoBridge#hostReply}.
++ * </ul>
++ */
++final class HostBridge {
++    private static final String TAG = "STR";
++    static final int REQ_SAVE = 4101;
++    static final int REQ_OPEN = 4102;
++
++    private final Activity activity;
++    private final WebView webView;
++    private final Handler ui = new Handler(Looper.getMainLooper());
++    // Bound calls can block for a long time (an install waits minutes for a
++    // speaker to reboot), so each gets its own thread; a fixed pool would let
++    // a few slow calls starve every other button in the UI. Wails does the same.
++    private final ExecutorService calls = Executors.newCachedThreadPool();
++    private volatile boolean pumping;
++
++    // One picker at a time; the activity forwards its result here.
++    private JSONObject pendingSave;
++    private long pendingOpenId;
++    private String pendingOpenTarget;
++
++    HostBridge(Activity activity, WebView webView) {
++        this.activity = activity;
++        this.webView = webView;
++    }
++
++    // ---- JavaScript interface ----------------------------------------------------
++
++    @JavascriptInterface
++    public void call(final int id, final String method, final String argsJson) {
++        calls.execute(() -> {
++            String env;
++            try {
++                env = GoBridge.str(GoBridge.call(GoBridge.utf8(method), GoBridge.utf8(argsJson)));
++            } catch (Throwable t) {
++                env = errorEnvelope(String.valueOf(t));
++            }
++            if (env == null) env = errorEnvelope("no answer from the app core");
++            js("window.__strReply(" + id + "," + env + ")");
++        });
++    }
++
++    @JavascriptInterface
++    public void emit(String name, String dataJson) {
++        calls.execute(() -> GoBridge.emit(GoBridge.utf8(name), GoBridge.utf8(dataJson)));
++    }
++
++    @JavascriptInterface
++    public void openURL(String url) {
++        ui.post(() -> openExternal(url));
++    }
++
++    @JavascriptInterface
++    public void clipboardSet(String text) {
++        ui.post(() -> {
++            ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
++            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("ST Reborn", text));
++        });
++    }
++
++    @JavascriptInterface
++    public String clipboardGet() {
++        ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
++        if (cm == null || !cm.hasPrimaryClip() || cm.getPrimaryClip().getItemCount() == 0) return "";
++        CharSequence t = cm.getPrimaryClip().getItemAt(0).coerceToText(activity);
++        return t == null ? "" : t.toString();
++    }
++
++    @JavascriptInterface
++    public void quit() {
++        ui.post(() -> activity.moveTaskToBack(true));
++    }
++
++    // ---- event pump ----------------------------------------------------------------
++
++    void startPump() {
++        if (pumping) return;
++        pumping = true;
++        Thread t = new Thread(() -> {
++            while (pumping) {
++                String ev;
++                try {
++                    ev = GoBridge.str(GoBridge.nextEvent(1000));
++                } catch (Throwable th) {
++                    Log.e(TAG, "event pump", th);
++                    return;
++                }
++                if (ev == null) continue;
++                try {
++                    JSONObject o = new JSONObject(ev);
++                    if ("host".equals(o.optString("kind"))) {
++                        handleHost(o);
++                    } else {
++                        js("window.__strEvent(" + ev + ")");
++                    }
++                } catch (JSONException e) {
++                    Log.w(TAG, "bad event from core: " + e);
++                }
++            }
++        }, "str-events");
++        t.setDaemon(true);
++        t.start();
++    }
++
++    void stopPump() {
++        pumping = false;
++    }
++
++    private void handleHost(JSONObject o) {
++        final long id = o.optLong("id");
++        final String op = o.optString("op");
++        final JSONObject args = o.optJSONObject("args") != null ? o.optJSONObject("args") : new JSONObject();
++        ui.post(() -> {
++            switch (op) {
++                case "openURL":
++                    openExternal(args.optString("url"));
++                    break;
++                case "clipboardSet":
++                    clipboardSet(args.optString("text"));
++                    break;
++                case "clipboardGet":
++                    reply(id, obj("text", clipboardGet()));
++                    break;
++                case "messageDialog":
++                    showMessageDialog(id, args);
++                    break;
++                case "saveFile":
++                    startSave(args);
++                    break;
++                case "openFile":
++                    startOpen(id, args);
++                    break;
++                case "reload":
++                    webView.reload();
++                    break;
++                case "execJS":
++                    webView.evaluateJavascript(args.optString("js"), null);
++                    break;
++                case "quit":
++                    activity.moveTaskToBack(true);
++                    break;
++                default:
++                    Log.w(TAG, "unknown host op " + op);
++                    if (id != 0) reply(id, new JSONObject());
++            }
++        });
++    }
++
++    // ---- host operations -------------------------------------------------------------
++
++    void openExternal(String url) {
++        if (url == null || url.isEmpty()) return;
++        try {
++            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
++            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++            activity.startActivity(i);
++        } catch (ActivityNotFoundException e) {
++            Toast.makeText(activity, url, Toast.LENGTH_LONG).show();
++        }
++    }
++
++    private void showMessageDialog(long id, JSONObject a) {
++        JSONArray buttons = a.optJSONArray("buttons");
++        String cancel = a.optString("cancelButton", "");
++        AlertDialog.Builder b = new AlertDialog.Builder(activity)
++                .setTitle(a.optString("title"))
++                .setMessage(a.optString("message"))
++                .setOnCancelListener(d -> reply(id, obj("button", cancel)));
++        // AlertDialog has three button slots. Wails dialogs in STR use one or two.
++        if (buttons != null && buttons.length() > 0) {
++            final String b0 = buttons.optString(0);
++            if (buttons.length() == 1) {
++                b.setPositiveButton(b0, (d, w) -> reply(id, obj("button", b0)));
++            } else {
++                final String b1 = buttons.optString(1);
++                // The cancel/default choice goes on the negative (left) slot.
++                String neg = b0, pos = b1;
++                if (b1.equals(cancel)) { neg = b1; pos = b0; }
++                final String fNeg = neg, fPos = pos;
++                b.setNegativeButton(fNeg, (d, w) -> reply(id, obj("button", fNeg)));
++                b.setPositiveButton(fPos, (d, w) -> reply(id, obj("button", fPos)));
++                if (buttons.length() > 2) {
++                    final String b2 = buttons.optString(2);
++                    b.setNeutralButton(b2, (d, w) -> reply(id, obj("button", b2)));
++                }
++            }
++        } else {
++            b.setPositiveButton(android.R.string.ok, (d, w) -> reply(id, obj("button", "OK")));
++        }
++        b.show();
++    }
++
++    private void startSave(JSONObject a) {
++        pendingSave = a;
++        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
++        i.addCategory(Intent.CATEGORY_OPENABLE);
++        i.setType(a.optString("mime", "application/octet-stream"));
++        i.putExtra(Intent.EXTRA_TITLE, a.optString("name", "export"));
++        try {
++            activity.startActivityForResult(i, REQ_SAVE);
++        } catch (ActivityNotFoundException e) {
++            pendingSave = null;
++            Toast.makeText(activity, R.string.no_file_picker, Toast.LENGTH_LONG).show();
++        }
++    }
++
++    private void startOpen(long id, JSONObject a) {
++        pendingOpenId = id;
++        pendingOpenTarget = a.optString("target");
++        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
++        i.addCategory(Intent.CATEGORY_OPENABLE);
++        i.setType("*/*");
++        JSONArray m = a.optJSONArray("mimes");
++        if (m != null && m.length() > 0) {
++            String[] mimes = new String[m.length()];
++            for (int k = 0; k < m.length(); k++) mimes[k] = m.optString(k);
++            i.putExtra(Intent.EXTRA_MIME_TYPES, mimes);
++        }
++        try {
++            activity.startActivityForResult(i, REQ_OPEN);
++        } catch (ActivityNotFoundException e) {
++            pendingOpenId = 0;
++            reply(id, obj("error", activity.getString(R.string.no_file_picker)));
++        }
++    }
++
++    /** Called from MainActivity.onActivityResult. */
++    boolean onActivityResult(int requestCode, int resultCode, Intent data) {
++        if (requestCode == REQ_SAVE) {
++            final JSONObject a = pendingSave;
++            pendingSave = null;
++            if (a == null || resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return true;
++            final Uri dest = data.getData();
++            calls.execute(() -> {
++                File src = new File(a.optString("path"));
++                try (InputStream in = new FileInputStream(src);
++                     OutputStream out = activity.getContentResolver().openOutputStream(dest, "wt")) {
++                    copy(in, out);
++                    toast(activity.getString(R.string.saved_as, displayName(dest, a.optString("name"))));
++                } catch (IOException | SecurityException e) {
++                    Log.e(TAG, "save failed", e);
++                    toast(activity.getString(R.string.save_failed, String.valueOf(e.getMessage())));
++                } finally {
++                    //noinspection ResultOfMethodCallIgnored
++                    src.delete();
++                }
++            });
++            return true;
++        }
++        if (requestCode == REQ_OPEN) {
++            final long id = pendingOpenId;
++            final String target = pendingOpenTarget;
++            pendingOpenId = 0;
++            if (id == 0) return true;
++            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
++                reply(id, obj("path", ""));
++                return true;
++            }
++            final Uri src = data.getData();
++            calls.execute(() -> {
++                String name = sanitize(displayName(src, "import"));
++                File dir = new File(target == null || target.isEmpty()
++                        ? activity.getCacheDir().getPath() : target);
++                //noinspection ResultOfMethodCallIgnored
++                dir.mkdirs();
++                File dst = new File(dir, name);
++                try (InputStream in = activity.getContentResolver().openInputStream(src);
++                     OutputStream out = new FileOutputStream(dst)) {
++                    if (in == null) throw new IOException("the file could not be opened");
++                    copy(in, out);
++                    reply(id, obj("path", dst.getAbsolutePath()));
++                } catch (IOException | SecurityException e) {
++                    reply(id, obj("error", String.valueOf(e.getMessage())));
++                }
++            });
++            return true;
++        }
++        return false;
++    }
++
++    // ---- helpers -------------------------------------------------------------------------
++
++    private void js(String script) {
++        ui.post(() -> webView.evaluateJavascript(script, null));
++    }
++
++    private void toast(String msg) {
++        ui.post(() -> Toast.makeText(activity, msg, Toast.LENGTH_LONG).show());
++    }
++
++    private static void reply(long id, JSONObject payload) {
++        if (id == 0) return;
++        GoBridge.hostReply(id, GoBridge.utf8(payload.toString()));
++    }
++
++    private static JSONObject obj(String k, String v) {
++        JSONObject o = new JSONObject();
++        try {
++            o.put(k, v == null ? "" : v);
++        } catch (JSONException ignored) {
++            // put with a non-null String key cannot fail
++        }
++        return o;
++    }
++
++    private static String errorEnvelope(String msg) {
++        JSONObject o = new JSONObject();
++        try {
++            o.put("ok", false);
++            o.put("error", msg);
++        } catch (JSONException ignored) {
++            // cannot fail
++        }
++        return o.toString();
++    }
++
++    private String displayName(Uri uri, String fallback) {
++        try (Cursor c = activity.getContentResolver().query(uri,
++                new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
++            if (c != null && c.moveToFirst()) {
++                String n = c.getString(0);
++                if (n != null && !n.isEmpty()) return n;
++            }
++        } catch (RuntimeException ignored) {
++            // some providers do not answer the query; the fallback is fine
++        }
++        return fallback;
++    }
++
++    private static String sanitize(String name) {
++        String n = name.replaceAll("[/\\\\:*?\"<>|\\x00]", "_");
++        return n.isEmpty() ? "import" : n;
++    }
++
++    private static void copy(InputStream in, OutputStream out) throws IOException {
++        if (out == null) throw new IOException("the destination could not be opened");
++        byte[] buf = new byte[64 * 1024];
++        int n;
++        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
++        out.flush();
++    }
++}
+diff --git a/android/app/src/main/java/de/streborn/android/MainActivity.java b/android/app/src/main/java/de/streborn/android/MainActivity.java
+new file mode 100644
+index 00000000..e2b002f6
+--- /dev/null
++++ b/android/app/src/main/java/de/streborn/android/MainActivity.java
+@@ -0,0 +1,400 @@
++package de.streborn.android;
++
++import android.annotation.SuppressLint;
++import android.app.Activity;
++import android.content.Context;
++import android.content.Intent;
++import android.graphics.Color;
++import android.net.ConnectivityManager;
++import android.net.LinkProperties;
++import android.net.Network;
++import android.net.NetworkCapabilities;
++import android.net.NetworkRequest;
++import android.net.Uri;
++import android.net.wifi.WifiManager;
++import android.os.Build;
++import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.system.ErrnoException;
++import android.system.Os;
++import android.util.Log;
++import android.view.View;
++import android.view.WindowInsets;
++import android.view.WindowManager;
++import android.webkit.WebChromeClient;
++import android.webkit.WebResourceRequest;
++import android.webkit.WebResourceResponse;
++import android.webkit.WebSettings;
++import android.webkit.WebView;
++import android.webkit.WebViewClient;
++import android.widget.FrameLayout;
++
++import androidx.annotation.NonNull;
++import androidx.webkit.WebViewAssetLoader;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.io.File;
++import java.net.InetAddress;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++
++/**
++ * Hosts the STR desktop app's unchanged frontend in a WebView, backed by its
++ * unchanged Go core running in-process (libstr.so).
++ */
++public class MainActivity extends Activity {
++    private static final String TAG = "STR";
++
++    /**
++     * The page is served from https://wails.localhost/, the origin Wails itself
++     * uses on Windows. Every STR speaker agent already allows exactly that
++     * origin to read its answers (internal/webui/server.go, allowedCORSOrigins),
++     * so the frontend's direct speaker requests work against agents already in
++     * the field, and HTTPS keeps the page a secure context.
++     */
++    static final String ORIGIN_HOST = "wails.localhost";
++    static final String START_URL = "https://" + ORIGIN_HOST + "/index.html";
++
++    private static boolean coreStarted;
++
++    private WebView webView;
++    private HostBridge bridge;
++    private WifiManager.MulticastLock multicastLock;
++    private ConnectivityManager.NetworkCallback netCallback;
++    private ConnectivityManager.NetworkCallback wifiCallback;
++    private Network boundWifi;
++    private final Handler ui = new Handler(Looper.getMainLooper());
++    private final Runnable busyPoll = new Runnable() {
++        @Override
++        public void run() {
++            boolean busy = false;
++            try {
++                busy = coreStarted && GoBridge.busy();
++            } catch (Throwable ignored) {
++                // core not loaded
++            }
++            if (busy) {
++                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
++            } else {
++                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
++            }
++            ui.postDelayed(this, 2000);
++        }
++    };
++
++    @SuppressLint("SetJavaScriptEnabled")
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++
++        startCore();
++
++        // mDNS and SSDP discovery need multicast, which Wi-Fi drivers filter
++        // out unless an app holds this lock.
++        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
++        if (wm != null) {
++            multicastLock = wm.createMulticastLock("str-discovery");
++            multicastLock.setReferenceCounted(false);
++            multicastLock.acquire();
++        }
++        watchNetwork();
++
++        FrameLayout root = new FrameLayout(this);
++        root.setBackgroundColor(Color.rgb(27, 38, 54)); // the desktop window's background
++        webView = new WebView(this);
++        webView.setBackgroundColor(Color.rgb(27, 38, 54));
++        root.addView(webView, new FrameLayout.LayoutParams(
++                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
++        setContentView(root);
++        applyInsets(root);
++
++        WebSettings s = webView.getSettings();
++        s.setJavaScriptEnabled(true);
++        s.setDomStorageEnabled(true);
++        s.setDatabaseEnabled(true);
++        s.setAllowFileAccess(false);
++        s.setAllowContentAccess(false);
++        s.setMediaPlaybackRequiresUserGesture(false);
++        s.setSupportMultipleWindows(false);
++        // The page is https; speakers and station logos are plain http on the
++        // LAN and the open web. The desktop webview allows the same (see the
++        // CSP in frontend/index.html: connect-src and img-src include http:).
++        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
++        s.setUserAgentString(s.getUserAgentString() + " STReborn-Android/" + BuildConfig.VERSION_NAME);
++        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
++
++        final WebViewAssetLoader assets = new WebViewAssetLoader.Builder()
++                .setDomain(ORIGIN_HOST)
++                .addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this))
++                .build();
++
++        webView.setWebViewClient(new WebViewClient() {
++            @Override
++            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
++                Uri u = req.getUrl();
++                if (ORIGIN_HOST.equals(u.getHost())) {
++                    String p = u.getPath();
++                    if (p == null || p.isEmpty() || "/".equals(p)) {
++                        u = u.buildUpon().path("/index.html").build();
++                    }
++                    // The built frontend is copied under assets/web/.
++                    Uri mapped = u.buildUpon().path("/web" + u.getPath()).build();
++                    return assets.shouldInterceptRequest(mapped);
++                }
++                return null;
++            }
++
++            @Override
++            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
++                Uri u = req.getUrl();
++                if (ORIGIN_HOST.equals(u.getHost())) return false;
++                // Anything else (help pages, GitHub, donate links, a speaker's
++                // phone page) opens in the browser, as on the desktop.
++                bridge.openExternal(u.toString());
++                return true;
++            }
++        });
++        // Setting a WebChromeClient is what enables window.confirm() and
++        // friends; without one the WebView answers them silently with false.
++        webView.setWebChromeClient(new WebChromeClient());
++
++        bridge = new HostBridge(this, webView);
++        webView.addJavascriptInterface(bridge, "STRHost");
++        bridge.startPump();
++
++        if (savedInstanceState != null) {
++            webView.restoreState(savedInstanceState);
++        } else {
++            webView.loadUrl(START_URL);
++        }
++    }
++
++    /**
++     * Loads libstr.so and starts the Go core, once per process. The environment
++     * must be in place before the library loads: the Go runtime snapshots it
++     * at load time, and the app finds its config, cache and log directories
++     * through HOME and the XDG variables.
++     */
++    private void startCore() {
++        if (coreStarted) return;
++        File files = getFilesDir();
++        File cache = getCacheDir();
++        File resolv = new File(files, "resolv.conf");
++        setenv("HOME", files.getAbsolutePath());
++        setenv("XDG_CONFIG_HOME", new File(files, "config").getAbsolutePath());
++        setenv("XDG_DATA_HOME", new File(files, "data").getAbsolutePath());
++        setenv("XDG_CACHE_HOME", cache.getAbsolutePath());
++        setenv("TMPDIR", new File(cache, "tmp").getAbsolutePath());
++        setenv("STR_RESOLV_CONF", resolv.getAbsolutePath());
++        if (BuildConfig.DEBUG) setenv("STR_DEBUG", "1");
++        writeResolvConf(null);
++
++        System.loadLibrary("str");
++
++        final JSONObject cfg = new JSONObject();
++        try {
++            cfg.put("filesDir", files.getAbsolutePath());
++            cfg.put("cacheDir", cache.getAbsolutePath());
++            cfg.put("sdkInt", Build.VERSION.SDK_INT);
++        } catch (JSONException ignored) {
++            // cannot fail
++        }
++        // startup() runs synchronously and touches the network; keep it off
++        // the UI thread. Calls that arrive before it finishes are fine: the
++        // desktop app is written for Wails, which dispatches them the same way.
++        Thread t = new Thread(() -> GoBridge.start(GoBridge.utf8(cfg.toString())), "str-start");
++        t.start();
++        coreStarted = true;
++    }
++
++    private static void setenv(String k, String v) {
++        try {
++            Os.setenv(k, v, true);
++        } catch (ErrnoException e) {
++            Log.w(TAG, "setenv " + k, e);
++        }
++    }
++
++    /**
++     * Two jobs, both about which network the core talks over.
++     *
++     * <p>Wi-Fi first: the core only ever wants the LAN the speakers are on. When
++     * that Wi-Fi has no internet, which is exactly the case while a new speaker
++     * is set up through its own access point, Android keeps mobile data as the
++     * default network, and an app's sockets follow the default network's routing
++     * table, so packets for the speaker would leave over cellular. Binding the
++     * process to the Wi-Fi network while one is connected makes the phone behave
++     * like the desktop does on the same network.
++     *
++     * <p>DNS: keeps the resolv.conf that Go's pure-Go resolver reads in step with
++     * the network in use (see android/goport/overlay); Android has no
++     * /etc/resolv.conf of its own.
++     */
++    private void watchNetwork() {
++        final ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
++        if (cm == null) return;
++        Network active = cm.getActiveNetwork();
++        if (active != null) writeResolvConf(cm.getLinkProperties(active));
++
++        netCallback = new ConnectivityManager.NetworkCallback() {
++            @Override
++            public void onLinkPropertiesChanged(@NonNull Network network, @NonNull LinkProperties lp) {
++                if (boundWifi == null) writeResolvConf(lp);
++            }
++        };
++        cm.registerDefaultNetworkCallback(netCallback);
++
++        NetworkRequest wifi = new NetworkRequest.Builder()
++                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
++                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
++                .build();
++        wifiCallback = new ConnectivityManager.NetworkCallback() {
++            @Override
++            public void onAvailable(@NonNull Network network) {
++                boundWifi = network;
++                cm.bindProcessToNetwork(network);
++                LinkProperties lp = cm.getLinkProperties(network);
++                if (lp != null) writeResolvConf(lp);
++                Log.i(TAG, "bound to Wi-Fi network " + network);
++            }
++
++            @Override
++            public void onLinkPropertiesChanged(@NonNull Network network, @NonNull LinkProperties lp) {
++                if (network.equals(boundWifi)) writeResolvConf(lp);
++            }
++
++            @Override
++            public void onLost(@NonNull Network network) {
++                if (!network.equals(boundWifi)) return;
++                boundWifi = null;
++                cm.bindProcessToNetwork(null);
++                Network def = cm.getActiveNetwork();
++                if (def != null) writeResolvConf(cm.getLinkProperties(def));
++                Log.i(TAG, "Wi-Fi lost; following the default network");
++            }
++        };
++        cm.registerNetworkCallback(wifi, wifiCallback);
++    }
++
++    private void writeResolvConf(LinkProperties lp) {
++        StringBuilder sb = new StringBuilder("# written by ST Reborn for its Go DNS resolver\n");
++        boolean any = false;
++        if (lp != null) {
++            if (lp.getDomains() != null && !lp.getDomains().isEmpty()) {
++                sb.append("search ").append(lp.getDomains().replace(',', ' ')).append('\n');
++            }
++            for (InetAddress a : lp.getDnsServers()) {
++                String h = a.getHostAddress();
++                if (h == null) continue;
++                int pct = h.indexOf('%'); // strip IPv6 zone
++                sb.append("nameserver ").append(pct > 0 ? h.substring(0, pct) : h).append('\n');
++                any = true;
++            }
++        }
++        if (!any) {
++            // No network information yet: leave an existing file alone rather
++            // than replace good servers with nothing.
++            if (new File(getFilesDir(), "resolv.conf").exists()) return;
++            sb.append("nameserver 8.8.8.8\nnameserver 1.1.1.1\n");
++        }
++        sb.append("options timeout:2 attempts:2\n");
++        try {
++            File dst = new File(getFilesDir(), "resolv.conf");
++            File tmp = new File(getFilesDir(), "resolv.conf.tmp");
++            Files.write(tmp.toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
++            Files.move(tmp.toPath(), dst.toPath(), StandardCopyOption.REPLACE_EXISTING,
++                    StandardCopyOption.ATOMIC_MOVE);
++        } catch (Exception e) {
++            Log.w(TAG, "could not write resolv.conf", e);
++        }
++    }
++
++    /** Keeps the page clear of the status and navigation bars (edge-to-edge on Android 15+). */
++    private void applyInsets(View root) {
++        root.setOnApplyWindowInsetsListener((v, insets) -> {
++            int l, t, r, b;
++            if (Build.VERSION.SDK_INT >= 30) {
++                android.graphics.Insets i = insets.getInsets(
++                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
++                l = i.left; t = i.top; r = i.right; b = i.bottom;
++            } else {
++                l = insets.getSystemWindowInsetLeft();
++                t = insets.getSystemWindowInsetTop();
++                r = insets.getSystemWindowInsetRight();
++                b = insets.getSystemWindowInsetBottom();
++            }
++            v.setPadding(l, t, r, b);
++            return insets;
++        });
++    }
++
++    @Override
++    protected void onResume() {
++        super.onResume();
++        ui.post(busyPoll);
++    }
++
++    @Override
++    protected void onPause() {
++        ui.removeCallbacks(busyPoll);
++        super.onPause();
++    }
++
++    @Override
++    protected void onSaveInstanceState(@NonNull Bundle out) {
++        super.onSaveInstanceState(out);
++        if (webView != null) webView.saveState(out);
++    }
++
++    @SuppressWarnings("deprecation")
++    @Override
++    public void onBackPressed() {
++        // The frontend is one page with no history to go back through. Leaving
++        // is the desktop's "close window": ask the core first, which refuses
++        // (after asking the user) while a speaker is mid-update. The app is then
++        // only moved to the background, so a running core keeps its state.
++        new Thread(() -> {
++            boolean prevent;
++            try {
++                prevent = GoBridge.beforeClose();
++            } catch (Throwable t) {
++                prevent = false;
++            }
++            if (!prevent) ui.post(() -> moveTaskToBack(true));
++        }, "str-close").start();
++    }
++
++    @SuppressWarnings("deprecation")
++    @Override
++    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
++        if (bridge != null && bridge.onActivityResult(requestCode, resultCode, data)) return;
++        super.onActivityResult(requestCode, resultCode, data);
++    }
++
++    @Override
++    protected void onDestroy() {
++        ui.removeCallbacks(busyPoll);
++        if (bridge != null) bridge.stopPump();
++        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
++        if (cm != null) {
++            for (ConnectivityManager.NetworkCallback cb : new ConnectivityManager.NetworkCallback[] {netCallback, wifiCallback}) {
++                if (cb == null) continue;
++                try {
++                    cm.unregisterNetworkCallback(cb);
++                } catch (IllegalArgumentException ignored) {
++                    // already unregistered
++                }
++            }
++        }
++        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
++        if (webView != null) {
++            webView.removeJavascriptInterface("STRHost");
++            webView.destroy();
++        }
++        super.onDestroy();
++    }
++}
+diff --git a/android/app/src/main/js/android-shim.js b/android/app/src/main/js/android-shim.js
+new file mode 100644
+index 00000000..d190b0ed
+--- /dev/null
++++ b/android/app/src/main/js/android-shim.js
+@@ -0,0 +1,210 @@
++// STR Android shim: stands in for the objects Wails injects into its webview.
++//
++// The frontend talks to Go only through two globals: window.go.main.App.<Method>
++// (generated bindings in frontend/wailsjs/go) and window.runtime.* (the Wails JS
++// runtime in frontend/wailsjs/runtime). This file recreates both on top of the
++// Android host's JavaScript interface (window.STRHost, see HostBridge.java), so
++// the frontend runs unchanged. It is loaded as a classic script ahead of the
++// module entry point, which guarantees it runs first.
++//
++// Contract with the host:
++//   STRHost.call(id, method, argsJSON)  -> later window.__strReply(id, envelope)
++//   STRHost.emit(name, dataJSON)        -> Go-side runtime.EventsOn listeners
++//   STRHost.openURL(url), STRHost.clipboardSet(text), STRHost.clipboardGet()
++//   window.__strEvent({name, data})     <- runtime.EventsEmit from Go
++(function () {
++  'use strict';
++  var host = window.STRHost;
++  if (!host) {
++    // Opened outside the Android app (e.g. in a desktop browser for debugging).
++    console.warn('STR Android shim: no host bridge, bindings will reject');
++  }
++
++  // ---- calls -----------------------------------------------------------------
++  var seq = 0;
++  var pending = new Map();
++
++  function call(method, args) {
++    return new Promise(function (resolve, reject) {
++      if (!host) {
++        reject(new Error('Not running inside the STR Android app'));
++        return;
++      }
++      var id = ++seq;
++      pending.set(id, { resolve: resolve, reject: reject });
++      try {
++        host.call(id, method, JSON.stringify(args));
++      } catch (e) {
++        pending.delete(id);
++        reject(e);
++      }
++    });
++  }
++
++  window.__strReply = function (id, env) {
++    var p = pending.get(id);
++    if (!p) return;
++    pending.delete(id);
++    if (env && env.ok) {
++      p.resolve(env.result === undefined ? null : env.result);
++    } else {
++      // Wails rejects with the error string itself, not an Error object; the
++      // frontend's error handling (friendly messages, String(err)) expects that.
++      p.reject(env && env.error !== undefined ? env.error : 'unknown error');
++    }
++  };
++
++  // window.go.main.App: every property is a binding. A Proxy rather than a list
++  // so methods added upstream work without touching this file.
++  var appProxy = new Proxy({}, {
++    get: function (_t, name) {
++      if (typeof name !== 'string' || name === 'then') return undefined;
++      return function () {
++        return call(name, Array.prototype.slice.call(arguments));
++      };
++    },
++  });
++  window.go = { main: { App: appProxy } };
++
++  // ---- events ----------------------------------------------------------------
++  var listeners = new Map(); // name -> [{cb, left}]
++
++  function on(name, cb, max) {
++    var list = listeners.get(name) || [];
++    var entry = { cb: cb, left: max === undefined ? -1 : max };
++    list.push(entry);
++    listeners.set(name, list);
++    return function () {
++      var l = listeners.get(name);
++      if (!l) return;
++      var i = l.indexOf(entry);
++      if (i >= 0) l.splice(i, 1);
++    };
++  }
++
++  function dispatch(name, data) {
++    var list = listeners.get(name);
++    if (!list || !list.length) return;
++    var snapshot = list.slice();
++    for (var i = 0; i < snapshot.length; i++) {
++      var e = snapshot[i];
++      if (e.left > 0) {
++        e.left--;
++        if (e.left === 0) {
++          var idx = list.indexOf(e);
++          if (idx >= 0) list.splice(idx, 1);
++        }
++      }
++      try {
++        e.cb.apply(null, data || []);
++      } catch (err) {
++        console.error('STR event listener for ' + name + ' failed', err);
++      }
++    }
++  }
++
++  window.__strEvent = function (ev) {
++    if (ev && ev.name) dispatch(ev.name, ev.data);
++  };
++
++  var noop = function () {};
++  var resolved = function (v) {
++    return function () { return Promise.resolve(v); };
++  };
++
++  window.runtime = {
++    EventsOnMultiple: on,
++    EventsOn: function (n, cb) { return on(n, cb, -1); },
++    EventsOnce: function (n, cb) { return on(n, cb, 1); },
++    EventsOff: function () {
++      for (var i = 0; i < arguments.length; i++) listeners.delete(arguments[i]);
++    },
++    EventsOffAll: function () { listeners.clear(); },
++    EventsEmit: function (name) {
++      var data = Array.prototype.slice.call(arguments, 1);
++      dispatch(name, data);
++      if (host) host.emit(name, JSON.stringify(data));
++    },
++
++    BrowserOpenURL: function (url) { if (host) host.openURL(String(url)); },
++    ClipboardSetText: function (text) {
++      if (host) host.clipboardSet(String(text));
++      return Promise.resolve(true);
++    },
++    ClipboardGetText: function () {
++      return Promise.resolve(host ? host.clipboardGet() : '');
++    },
++    Environment: resolved({ buildType: 'production', platform: 'android', arch: '' }),
++
++    LogPrint: function (m) { console.log(m); },
++    LogTrace: function (m) { console.debug(m); },
++    LogDebug: function (m) { console.debug(m); },
++    LogInfo: function (m) { console.info(m); },
++    LogWarning: function (m) { console.warn(m); },
++    LogError: function (m) { console.error(m); },
++    LogFatal: function (m) { console.error(m); },
++
++    Quit: function () { if (host) host.quit(); },
++    Hide: noop,
++    Show: noop,
++    WindowReload: function () { location.reload(); },
++    WindowReloadApp: function () { location.reload(); },
++    WindowSetTitle: noop,
++    WindowFullscreen: noop,
++    WindowUnfullscreen: noop,
++    WindowIsFullscreen: resolved(true),
++    WindowCenter: noop,
++    WindowSetSystemDefaultTheme: noop,
++    WindowSetLightTheme: noop,
++    WindowSetDarkTheme: noop,
++    WindowShow: noop,
++    WindowHide: noop,
++    WindowSetSize: noop,
++    WindowGetSize: resolved({ w: window.innerWidth, h: window.innerHeight }),
++    WindowSetMinSize: noop,
++    WindowSetMaxSize: noop,
++    WindowSetAlwaysOnTop: noop,
++    WindowSetPosition: noop,
++    WindowGetPosition: resolved({ x: 0, y: 0 }),
++    WindowMaximise: noop,
++    WindowToggleMaximise: noop,
++    WindowUnmaximise: noop,
++    WindowIsMaximised: resolved(true),
++    WindowMinimise: noop,
++    WindowUnminimise: noop,
++    WindowIsMinimised: resolved(false),
++    WindowIsNormal: resolved(false),
++    WindowSetBackgroundColour: noop,
++    WindowPrint: noop,
++    ScreenGetAll: resolved([]),
++    OnFileDrop: noop,
++    OnFileDropOff: noop,
++    CanResolveFilePaths: function () { return false; },
++    ResolveFilePaths: noop,
++  };
++
++  // navigator.clipboard.writeText can be refused in an app WebView without a
++  // fresh user gesture; route it through the host, which always succeeds.
++  try {
++    if (host && navigator.clipboard) {
++      navigator.clipboard.writeText = function (text) {
++        host.clipboardSet(String(text));
++        return Promise.resolve();
++      };
++    }
++  } catch (_e) { /* read-only in some WebView versions; keep the original */ }
++
++  // Lets the stylesheet adapt the desktop layout for a phone (android.css).
++  document.documentElement.classList.add('platform-android');
++
++  // The tab strip scrolls sideways on a phone (android.css); bring a tab that
++  // was just chosen fully into view instead of leaving it half off-screen.
++  document.addEventListener('click', function (e) {
++    var t = e.target && e.target.closest ? e.target.closest('.tab-btn') : null;
++    if (t && t.scrollIntoView) {
++      setTimeout(function () {
++        t.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
++      }, 0);
++    }
++  }, true);
++})();
+diff --git a/android/app/src/main/js/android.css b/android/app/src/main/js/android.css
+new file mode 100644
+index 00000000..c1d4886b
+--- /dev/null
++++ b/android/app/src/main/js/android.css
+@@ -0,0 +1,66 @@
++/* Phone layout for the desktop frontend.
++ *
++ * Loaded only in the Android app (and the Android dev harness), after the
++ * frontend's own stylesheet. Every rule is scoped to html.platform-android,
++ * which android-shim.js sets, so nothing here can reach the desktop app. The
++ * frontend is already a single 720px column, so this is a short list of
++ * phone-specific corrections rather than a second layout.
++ */
++
++/* No grey flash on tap, no font inflation, no rubber-band glow at the edges. */
++html.platform-android {
++  -webkit-text-size-adjust: 100%;
++  text-size-adjust: 100%;
++  -webkit-tap-highlight-color: transparent;
++}
++html.platform-android body {
++  overscroll-behavior-y: none;
++}
++
++/* Tabs: eight of them do not fit a phone. Keep them on one line and let the
++ * strip scroll sideways, the way phone apps do. The shim scrolls the active
++ * tab into view when it is selected. */
++html.platform-android .tabs {
++  overflow-x: auto;
++  overflow-y: hidden;
++  scroll-snap-type: x proximity;
++  scrollbar-width: none;
++  -webkit-overflow-scrolling: touch;
++  /* Bleed to the screen edges so the strip reads as scrollable. */
++  margin-left: -14px;
++  margin-right: -14px;
++  padding: 0 14px;
++}
++html.platform-android .tabs::-webkit-scrollbar {
++  display: none;
++}
++html.platform-android .tab-btn {
++  flex: none;
++  white-space: nowrap;
++  scroll-snap-align: start;
++  padding: 12px 14px;
++  min-height: 44px;
++}
++
++/* App updates on Android arrive as a new APK, not through the desktop
++ * self-updater, which has no Android build to fetch. Speaker (agent)
++ * updates are unaffected: those live in their own banner and card. */
++html.platform-android #appUpdateBanner {
++  display: none !important;
++}
++
++/* Comfortable touch targets for the small text buttons. */
++html.platform-android button,
++html.platform-android select {
++  min-height: 40px;
++}
++html.platform-android input[type="range"] {
++  min-height: 32px;
++}
++
++/* Setup: the USB-stick route needs a computer that can see and format a USB
++ * drive, which a phone app cannot. The network install (the default route)
++ * stays; a stick can still be prepared with the desktop app. */
++html.platform-android #setupStickDetails {
++  display: none !important;
++}
+diff --git a/android/app/src/main/res/drawable-xxxhdpi/ic_launcher_foreground.png b/android/app/src/main/res/drawable-xxxhdpi/ic_launcher_foreground.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..3125de651e0e0f4ab8983ad65548d966cbdd1066
+GIT binary patch
+literal 16474
+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
+LYb#g5Ekge<9;sGz
+
+literal 0
+HcmV?d00001
+
+diff --git a/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml b/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+new file mode 100644
+index 00000000..5bb05ada
+--- /dev/null
++++ b/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
++    <background android:drawable="@color/str_background" />
++    <foreground android:drawable="@drawable/ic_launcher_foreground" />
++</adaptive-icon>
+diff --git a/android/app/src/main/res/mipmap-hdpi/ic_launcher.png b/android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..78fd66548b8b6b6e1797006b9d4a327d4087d9ad
+GIT binary patch
+literal 3229
+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
+P00000NkvXXu0mjf_HS5n
+
+literal 0
+HcmV?d00001
+
+diff --git a/android/app/src/main/res/mipmap-mdpi/ic_launcher.png b/android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..77a216489a95b6525d0862adbeb473db4199f224
+GIT binary patch
+literal 2051
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png b/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fc5dd41c7121c597fdfee089615d6c63e2cc733
+GIT binary patch
+literal 4743
+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
+V^fqY|!RP=0002ovPDHLkV1gRv9L)d#
+
+literal 0
+HcmV?d00001
+
+diff --git a/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png b/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..645db48bf1b0394d3712c641e12af888b0d40432
+GIT binary patch
+literal 7350
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png b/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..38578fd4390cde332c66e48dd882141151e53dc6
+GIT binary patch
+literal 9690
+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
+YZ2o+i<K`)X)oj7ZORGp#OPGZIAA6+urvLx|
+
+literal 0
+HcmV?d00001
+
+diff --git a/android/app/src/main/res/values-de/strings.xml b/android/app/src/main/res/values-de/strings.xml
+new file mode 100644
+index 00000000..104b2844
+--- /dev/null
++++ b/android/app/src/main/res/values-de/strings.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="no_file_picker">Keine App zum Auswählen einer Datei vorhanden.</string>
++    <string name="saved_as">Gespeichert als %1$s</string>
++    <string name="save_failed">Die Datei konnte nicht gespeichert werden: %1$s</string>
++</resources>
+diff --git a/android/app/src/main/res/values/colors.xml b/android/app/src/main/res/values/colors.xml
+new file mode 100644
+index 00000000..2feb2007
+--- /dev/null
++++ b/android/app/src/main/res/values/colors.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <!-- The desktop window's background colour (desktop-app/main.go). -->
++    <color name="str_background">#1B2636</color>
++</resources>
+diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
+new file mode 100644
+index 00000000..7f987510
+--- /dev/null
++++ b/android/app/src/main/res/values/strings.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="app_name">ST Reborn</string>
++    <string name="no_file_picker">No app is available to pick a file.</string>
++    <string name="saved_as">Saved as %1$s</string>
++    <string name="save_failed">Could not save the file: %1$s</string>
++</resources>
+diff --git a/android/app/src/main/res/values/themes.xml b/android/app/src/main/res/values/themes.xml
+new file mode 100644
+index 00000000..0cb1de0d
+--- /dev/null
++++ b/android/app/src/main/res/values/themes.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <style name="Theme.STR" parent="@android:style/Theme.Material.NoActionBar">
++        <item name="android:windowBackground">@color/str_background</item>
++        <item name="android:statusBarColor">@color/str_background</item>
++        <item name="android:navigationBarColor">@color/str_background</item>
++        <item name="android:colorAccent">#4FA3E0</item>
++    </style>
++</resources>
+diff --git a/android/app/src/main/res/xml/network_security_config.xml b/android/app/src/main/res/xml/network_security_config.xml
+new file mode 100644
+index 00000000..0d351cbf
+--- /dev/null
++++ b/android/app/src/main/res/xml/network_security_config.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Speakers answer plain HTTP on the LAN (agent :8888/:17008, Bose API :8090,
++     UPnP :8091) and station logos are often http. The Go core uses raw sockets
++     and is unaffected by this file; it covers the WebView's direct requests. -->
++<network-security-config>
++    <base-config cleartextTrafficPermitted="true">
++        <trust-anchors>
++            <certificates src="system" />
++        </trust-anchors>
++    </base-config>
++</network-security-config>
+diff --git a/android/build.gradle b/android/build.gradle
+new file mode 100644
+index 00000000..ceb1e025
+--- /dev/null
++++ b/android/build.gradle
+@@ -0,0 +1,3 @@
++plugins {
++    id 'com.android.application' version '8.13.0' apply false
++}
+diff --git a/android/build.sh b/android/build.sh
+new file mode 100755
+index 00000000..1a07b063
+--- /dev/null
++++ b/android/build.sh
+@@ -0,0 +1,182 @@
++#!/usr/bin/env bash
++# Build the ST Reborn Android app.
++#
++#   android/build.sh            build everything and assemble the APK
++#   SKIP_GRADLE=1 android/build.sh   stop after the native library and assets
++#
++# What it does, in the order the Makefile's wails-build does it:
++#   1. cross-compiles the speaker agent (linux/arm, GOARM=5) with the same
++#      version stamp as the app, so a freshly updated speaker never reads as
++#      out of date (see CLAUDE.md, "Build version stamping");
++#   2. optionally fetches the go-librespot Spotify engine (WITH_ENGINE=1);
++#   3. builds the unchanged desktop frontend and adds the Android shim;
++#   4. builds desktop-app as libstr.so for each Android ABI, against the Wails
++#      stand-in (go.android.mod) with the net-package overlay;
++#   5. runs Gradle.
++#
++# Nothing tracked is modified: the agent and engine reach their go:embed slots
++# through `go build -overlay`, and the frontend is built outside frontend/dist.
++#
++# Requirements: Go (the version in go.mod), Node/npm, the Android NDK
++# (ANDROID_NDK_HOME, or an ndk/ folder under ANDROID_HOME), and for step 5 the
++# Android SDK plus Gradle. Android Studio provides the last three.
++set -euo pipefail
++
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++APPDIR="$ROOT/desktop-app"
++GO="${GO:-go}"
++
++VERSION="${VERSION:-$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)}"
++BUILD_STAMP="${BUILD_STAMP:-$(date '+%Y-%m-%d-%H%M')}"
++ABIS="${ABIS:-arm64-v8a armeabi-v7a x86_64}"
++MIN_API="${MIN_API:-26}"
++
++# Module files. Overridable so an offline or mirrored environment can point at
++# local copies of the dependencies without editing the committed ones.
++APP_MODFILE="${STR_APP_MODFILE:-$APPDIR/go.android.mod}"
++ROOT_MODFILE="${STR_ROOT_MODFILE:-$ROOT/go.mod}"
++
++WORK="$HERE/app/build/str-work"
++GEN="$HERE/app/build/generated/str"
++mkdir -p "$WORK" "$GEN"
++
++log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
++
++# ---- version code: v0.9.95-7-gabc -> 0*10^6 + 9*10^4 + 95*10^2 + 7 ------------
++version_code() {
++  local v="${1#v}" maj min pat extra
++  IFS=.- read -r maj min pat extra _ <<<"$v" || true
++  [[ "$maj" =~ ^[0-9]+$ ]] || { echo 1; return; }
++  [[ "$min" =~ ^[0-9]+$ ]] || min=0
++  [[ "$pat" =~ ^[0-9]+$ ]] || pat=0
++  [[ "$extra" =~ ^[0-9]+$ ]] || extra=0
++  (( extra > 99 )) && extra=99
++  echo $(( maj * 1000000 + min * 10000 + pat * 100 + extra ))
++}
++VERSION_CODE="$(version_code "$VERSION")"
++log "version $VERSION (code $VERSION_CODE), build $BUILD_STAMP"
++
++# ---- 1. speaker agent -------------------------------------------------------------
++log "building the speaker agent (linux/arm, GOARM=5)"
++( cd "$ROOT" && GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 \
++    "$GO" build -modfile="$ROOT_MODFILE" -trimpath \
++    -ldflags="-s -w -X main.version=$VERSION -X main.buildStamp=$BUILD_STAMP" \
++    -o "$WORK/streborn-armv7l" ./cmd/agent )
++
++# ---- 2. Spotify engine (optional) ---------------------------------------------------
++ENGINE="$APPDIR/agentbin/go-librespot-armv7l"
++if [[ "${WITH_ENGINE:-0}" == 1 ]]; then
++  log "fetching go-librespot-armv7l from the latest release"
++  if command -v gh >/dev/null 2>&1; then
++    tag="$(gh release view --repo JRpersonal/streborn --json tagName --jq .tagName)"
++    gh release download "$tag" --repo JRpersonal/streborn -p go-librespot-armv7l -D "$WORK" --clobber
++  else
++    curl -fL -o "$WORK/go-librespot-armv7l" \
++      https://github.com/JRpersonal/streborn/releases/latest/download/go-librespot-armv7l
++  fi
++  ENGINE="$WORK/go-librespot-armv7l"
++else
++  echo "    (skipped; WITH_ENGINE=1 embeds it, needed to restore Spotify after an agent update)"
++fi
++
++# ---- 3. frontend ----------------------------------------------------------------------
++log "building the frontend"
++( cd "$APPDIR/frontend"
++  [[ -d node_modules ]] || npm ci --no-audit --no-fund
++  npx vite build --outDir "$WORK/web" --emptyOutDir --logLevel warn )
++rm -rf "$GEN/assets/web"
++mkdir -p "$GEN/assets"
++cp -R "$WORK/web" "$GEN/assets/web"
++cp "$HERE/app/src/main/js/android-shim.js" "$GEN/assets/web/android-shim.js"
++cp "$HERE/app/src/main/js/android.css" "$GEN/assets/web/android.css"
++# The shim must run before the module entry point; a classic <script> in the
++# head does. External files, because the page's CSP forbids inline script.
++python3 - "$GEN/assets/web/index.html" <<'PY'
++import re, sys
++p = sys.argv[1]
++s = open(p, encoding="utf-8").read()
++inject = ('<script src="./android-shim.js"></script>\n'
++          '    <link rel="stylesheet" href="./android.css"/>\n')
++if "android-shim.js" not in s:
++    # Phones need the page laid out at device width, without pinch-zoom
++    # fighting the app's own gestures.
++    s = re.sub(r'<meta content="width=device-width[^"]*" name="viewport"\s*/?>',
++               '<meta content="width=device-width, initial-scale=1.0, viewport-fit=cover" name="viewport"/>', s)
++    s = s.replace("</title>", "</title>\n    " + inject, 1)
++open(p, "w", encoding="utf-8").write(s)
++PY
++
++# ---- 4. native library --------------------------------------------------------------
++GOROOT_SRC="$("$GO" env GOROOT)/src"
++OV="$WORK/overlay"
++mkdir -p "$OV"
++# net: the stock files with two mechanical renames, plus the added fallbacks
++# (android/goport/overlay/interface_android_str.go explains why). Generated
++# from whatever GOROOT is in use, so a Go upgrade needs no edit here.
++sed -e 's/^func interfaceTable(/func interfaceTableNetlink(/' \
++    -e 's/syscall\.NetlinkRIB(/netlinkRIBCompat(/g' \
++    "$GOROOT_SRC/net/interface_linux.go" > "$OV/interface_linux.go"
++sed -e 's#"/etc/resolv.conf"#strResolvConfPath()#g' \
++    "$GOROOT_SRC/net/dnsclient_unix.go" > "$OV/dnsclient_unix.go"
++grep -q interfaceTableNetlink "$OV/interface_linux.go" || { echo "net overlay: interfaceTable not found"; exit 1; }
++grep -q strResolvConfPath "$OV/dnsclient_unix.go" || { echo "net overlay: resolv.conf path not found"; exit 1; }
++
++python3 - "$WORK/overlay.json" <<PY
++import json, sys
++repl = {
++    "$GOROOT_SRC/net/interface_linux.go": "$OV/interface_linux.go",
++    "$GOROOT_SRC/net/dnsclient_unix.go": "$OV/dnsclient_unix.go",
++    "$GOROOT_SRC/net/interface_android_str.go": "$HERE/goport/overlay/interface_android_str.go",
++    "$APPDIR/agentbin/streborn-armv7l": "$WORK/streborn-armv7l",
++    "$APPDIR/agentbin/go-librespot-armv7l": "$ENGINE",
++}
++json.dump({"Replace": repl}, open(sys.argv[1], "w"), indent=1)
++PY
++
++if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
++  for base in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Android/Sdk" "$HOME/Library/Android/sdk"; do
++    [[ -n "$base" && -d "$base/ndk" ]] || continue
++    ANDROID_NDK_HOME="$(ls -d "$base"/ndk/* | sort -V | tail -1)"
++    break
++  done
++fi
++[[ -n "${ANDROID_NDK_HOME:-}" && -d "$ANDROID_NDK_HOME" ]] || {
++  echo "Android NDK not found: set ANDROID_NDK_HOME (Android Studio: SDK Manager > SDK Tools > NDK)"; exit 1; }
++case "$(uname -s)" in
++  Linux) HOST_TAG=linux-x86_64 ;;
++  Darwin) HOST_TAG=darwin-x86_64 ;;
++  *) echo "unsupported build host"; exit 1 ;;
++esac
++TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG/bin"
++
++for abi in $ABIS; do
++  case "$abi" in
++    arm64-v8a)   goarch=arm64; goarm=;  cc="aarch64-linux-android${MIN_API}-clang" ;;
++    armeabi-v7a) goarch=arm;   goarm=7; cc="armv7a-linux-androideabi${MIN_API}-clang" ;;
++    x86_64)      goarch=amd64; goarm=;  cc="x86_64-linux-android${MIN_API}-clang" ;;
++    x86)         goarch=386;   goarm=;  cc="i686-linux-android${MIN_API}-clang" ;;
++    *) echo "unknown ABI $abi"; exit 1 ;;
++  esac
++  log "building libstr.so for $abi"
++  mkdir -p "$GEN/jniLibs/$abi"
++  ( cd "$APPDIR" && GOOS=android GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=1 CC="$TC/$cc" \
++      "$GO" build -modfile="$APP_MODFILE" -overlay="$WORK/overlay.json" \
++      -buildmode=c-shared -trimpath \
++      -ldflags="-s -w -X main.appVersion=$VERSION -X main.appBuild=$BUILD_STAMP -extldflags=-Wl,-z,max-page-size=16384" \
++      -o "$GEN/jniLibs/$abi/libstr.so" . )
++  rm -f "$GEN/jniLibs/$abi/libstr.h"
++done
++
++# ---- 5. APK -------------------------------------------------------------------------
++if [[ "${SKIP_GRADLE:-0}" == 1 ]]; then
++  log "native library and assets are in $GEN (SKIP_GRADLE=1)"
++  exit 0
++fi
++GRADLE="${GRADLE:-$(command -v gradle || true)}"
++[[ -n "$GRADLE" ]] || { echo "Gradle not found: open android/ in Android Studio, or set GRADLE"; exit 1; }
++log "assembling the APK"
++( cd "$HERE" && "$GRADLE" --no-daemon -q \
++    -PstrVersion="$VERSION" -PstrVersionCode="$VERSION_CODE" \
++    "${GRADLE_TASK:-assembleRelease}" )
++find "$HERE/app/build/outputs" -name '*.apk' -print
+diff --git a/android/goport/overlay/interface_android_str.go b/android/goport/overlay/interface_android_str.go
+new file mode 100644
+index 00000000..1f100c69
+--- /dev/null
++++ b/android/goport/overlay/interface_android_str.go
+@@ -0,0 +1,217 @@
++// Copyright 2011 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++//
++// Portions adapted from github.com/wlynxg/anet (BSD-3-Clause,
++// Copyright (c) 2023 wlynxg).
++
++//go:build android
++
++// This file is NOT part of the STR module. It is injected into the standard
++// library's net package with `go build -overlay` for the Android build only
++// (see android/goport/build-go.sh).
++//
++// Why: since Android 11 (API 30) an app's SELinux domain may no longer bind()
++// a NETLINK_ROUTE socket and may not send RTM_GETLINK. syscall.NetlinkRIB
++// does both, so net.Interfaces() and net.InterfaceAddrs() fail with
++// "permission denied" for every app that targets API 30+ (golang/go#40569).
++// STR's speaker discovery (mDNS via zeroconf, SSDP for media servers, the
++// per-subnet probe) is built on those two calls in about ten places, one of
++// them inside a third-party library, so it is fixed once, here, instead of in
++// every caller.
++//
++// The overlay renames the stock interfaceTable to interfaceTableNetlink and
++// routes every syscall.NetlinkRIB call through netlinkRIBCompat. On an older
++// Android, or anywhere the stock path still works, behaviour is unchanged.
++
++package net
++
++import (
++	"bytes"
++	"os"
++	"syscall"
++	"unsafe"
++)
++
++// interfaceTable tries the stock RTM_GETLINK dump first and falls back to
++// deriving the table from RTM_GETADDR plus per-interface ioctls, which the
++// app domain is still allowed to do. The fallback cannot see interfaces that
++// have no address (irrelevant for reaching a speaker) and never reports a
++// hardware address (Android hides MACs from apps anyway).
++func interfaceTable(ifindex int) ([]Interface, error) {
++	ift, err := interfaceTableNetlink(ifindex)
++	if err == nil && len(ift) > 0 {
++		return ift, nil
++	}
++	alt, aerr := interfaceTableFromAddrs(ifindex)
++	if aerr == nil {
++		return alt, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	return ift, nil
++}
++
++func interfaceTableFromAddrs(ifindex int) ([]Interface, error) {
++	tab, err := netlinkRIBCompat(syscall.RTM_GETADDR, syscall.AF_UNSPEC)
++	if err != nil {
++		return nil, os.NewSyscallError("netlinkrib", err)
++	}
++	msgs, err := syscall.ParseNetlinkMessage(tab)
++	if err != nil {
++		return nil, os.NewSyscallError("parsenetlinkmessage", err)
++	}
++	var ift []Interface
++	seen := make(map[uint32]bool)
++loop:
++	for _, m := range msgs {
++		switch m.Header.Type {
++		case syscall.NLMSG_DONE:
++			break loop
++		case syscall.RTM_NEWADDR:
++			ifam := (*syscall.IfAddrmsg)(unsafe.Pointer(&m.Data[0]))
++			if seen[ifam.Index] {
++				continue
++			}
++			seen[ifam.Index] = true
++			if ifindex != 0 && ifindex != int(ifam.Index) {
++				continue
++			}
++			if ifi := strLinkFromIndex(ifam.Index); ifi != nil {
++				ift = append(ift, *ifi)
++			}
++			if ifindex == int(ifam.Index) {
++				break loop
++			}
++		}
++	}
++	return ift, nil
++}
++
++// strIfReq mirrors struct ifreq: a 16-byte name followed by a union that is
++// at most 24 bytes on 64-bit targets.
++type strIfReq [40]byte
++
++func strIoctl(fd int, req uintptr, arg unsafe.Pointer) error {
++	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(arg))
++	if e != 0 {
++		return e
++	}
++	return nil
++}
++
++func strLinkFromIndex(index uint32) *Interface {
++	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
++	if err != nil {
++		return nil
++	}
++	defer syscall.Close(fd)
++
++	var r strIfReq
++	*(*uint32)(unsafe.Pointer(&r[syscall.IFNAMSIZ])) = index
++	if strIoctl(fd, syscall.SIOCGIFNAME, unsafe.Pointer(&r[0])) != nil {
++		return nil
++	}
++	name := string(bytes.TrimRight(r[:syscall.IFNAMSIZ], "\x00"))
++	ifi := &Interface{Index: int(index), Name: name}
++
++	r = strIfReq{}
++	copy(r[:syscall.IFNAMSIZ-1], name)
++	if strIoctl(fd, syscall.SIOCGIFMTU, unsafe.Pointer(&r[0])) == nil {
++		ifi.MTU = int(*(*int32)(unsafe.Pointer(&r[syscall.IFNAMSIZ])))
++	}
++	r = strIfReq{}
++	copy(r[:syscall.IFNAMSIZ-1], name)
++	if strIoctl(fd, syscall.SIOCGIFFLAGS, unsafe.Pointer(&r[0])) == nil {
++		ifi.Flags = linkFlags(uint32(*(*uint16)(unsafe.Pointer(&r[syscall.IFNAMSIZ]))))
++	}
++	return ifi
++}
++
++// netlinkRIBCompat is syscall.NetlinkRIB with a fallback that skips bind().
++// The kernel autobinds a netlink socket on first send, so the explicit bind
++// in the stock implementation is not needed for a dump request.
++func netlinkRIBCompat(proto, family int) ([]byte, error) {
++	tab, err := syscall.NetlinkRIB(proto, family)
++	if err == nil {
++		return tab, nil
++	}
++	if alt, aerr := strNetlinkRIBNoBind(proto, family); aerr == nil {
++		return alt, nil
++	}
++	return nil, err
++}
++
++func strNetlinkRIBNoBind(proto, family int) ([]byte, error) {
++	s, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, syscall.NETLINK_ROUTE)
++	if err != nil {
++		return nil, err
++	}
++	defer syscall.Close(s)
++
++	req := make([]byte, syscall.NLMSG_HDRLEN+syscall.SizeofRtGenmsg)
++	*(*uint32)(unsafe.Pointer(&req[0])) = uint32(len(req))
++	*(*uint16)(unsafe.Pointer(&req[4])) = uint16(proto)
++	*(*uint16)(unsafe.Pointer(&req[6])) = uint16(syscall.NLM_F_DUMP | syscall.NLM_F_REQUEST)
++	*(*uint32)(unsafe.Pointer(&req[8])) = 1 // seq
++	req[16] = byte(family)
++
++	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
++	if err := syscall.Sendto(s, req, 0, sa); err != nil {
++		return nil, err
++	}
++	lsa, err := syscall.Getsockname(s)
++	if err != nil {
++		return nil, err
++	}
++	lnl, ok := lsa.(*syscall.SockaddrNetlink)
++	if !ok {
++		return nil, syscall.EINVAL
++	}
++	var tab []byte
++	buf := make([]byte, syscall.Getpagesize())
++	for {
++		n, _, err := syscall.Recvfrom(s, buf, 0)
++		if err != nil {
++			return nil, err
++		}
++		if n < syscall.NLMSG_HDRLEN {
++			return nil, syscall.EINVAL
++		}
++		chunk := buf[:n]
++		tab = append(tab, chunk...)
++		msgs, err := syscall.ParseNetlinkMessage(chunk)
++		if err != nil {
++			return nil, err
++		}
++		for _, m := range msgs {
++			if m.Header.Seq != 1 || m.Header.Pid != lnl.Pid {
++				return nil, syscall.EINVAL
++			}
++			if m.Header.Type == syscall.NLMSG_DONE {
++				return tab, nil
++			}
++			if m.Header.Type == syscall.NLMSG_ERROR {
++				return nil, syscall.EINVAL
++			}
++		}
++	}
++}
++
++// strResolvConfPath points the pure-Go DNS resolver at the resolv.conf the
++// Android host writes (android/app: DnsConfigWriter), because Android has no
++// /etc/resolv.conf and the stock fallback, 127.0.0.1:53, answers nothing
++// (golang/go#8877). Lookups through net.DefaultResolver already go to the
++// platform resolver via cgo on Android; this matters for resolvers pinned
++// with PreferGo, which STR's update client deliberately uses. The overlay
++// substitutes this call for the literal path in dnsclient_unix.go, and the
++// stock 5-second mtime check picks up rewrites after a network change.
++func strResolvConfPath() string {
++	if p := os.Getenv("STR_RESOLV_CONF"); p != "" {
++		if _, err := os.Stat(p); err == nil {
++			return p
++		}
++	}
++	return "/etc/resolv.conf"
++}
+diff --git a/android/gradle.properties b/android/gradle.properties
+new file mode 100644
+index 00000000..691500e1
+--- /dev/null
++++ b/android/gradle.properties
+@@ -0,0 +1,3 @@
++org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
++android.useAndroidX=true
++android.nonTransitiveRClass=true
+diff --git a/android/settings.gradle b/android/settings.gradle
+new file mode 100644
+index 00000000..9e9dacea
+--- /dev/null
++++ b/android/settings.gradle
+@@ -0,0 +1,16 @@
++pluginManagement {
++    repositories {
++        google()
++        mavenCentral()
++        gradlePluginPortal()
++    }
++}
++dependencyResolutionManagement {
++    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
++    repositories {
++        google()
++        mavenCentral()
++    }
++}
++rootProject.name = "STReborn-Android"
++include ':app'
+-- 
+2.43.0
+

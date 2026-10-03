@@ -1,0 +1,1314 @@
+From fccc9cab60e7dcd068f0431a6dbe4ec4e4c46fa6 Mon Sep 17 00:00:00 2001
+From: Joel Brower <joel.brower@gmail.com>
+Date: Sat, 3 Oct 2026 07:20:03 -0500
+Subject: [PATCH 6/6] feat(android): build an installable APK without Gradle or
+ the NDK
+
+Process mode: the Go core is built as a pure android/arm64 executable, which
+needs no cgo and so no NDK, ships as a native library, and runs as a child
+process reached over a loopback port with a per-launch token. It exits with
+the app. Core.java picks JNI or process mode at startup; nothing above it
+changes. The app no longer depends on AndroidX, so android/build-apk.sh can
+assemble it with aapt, javac, dx, zipalign and apksigner alone.
+
+Also: pass the phone's time zone to the core, which otherwise runs on UTC
+(alarms, clock sync), and correct the note on Wi-Fi binding, which reaches
+the WebView but not Go's raw sockets.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016wzfhQtsFu3EKKkUkehQyh
+---
+ android/README.md                             |  27 ++-
+ android/app/build.gradle                      |  12 +-
+ android/app/src/main/AndroidManifest.xml      |   1 +
+ .../main/java/de/streborn/android/Core.java   |  89 ++++++++
+ .../java/de/streborn/android/HostBridge.java  |  55 ++---
+ .../de/streborn/android/MainActivity.java     | 139 +++++++-----
+ .../java/de/streborn/android/ProcessCore.java | 206 +++++++++++++++++
+ android/build-apk.sh                          | 207 ++++++++++++++++++
+ android/gradle.properties                     |   1 -
+ android/wailsshim/process.go                  | 149 +++++++++++++
+ android/wailsshim/wails.go                    |  18 +-
+ 11 files changed, 813 insertions(+), 91 deletions(-)
+ create mode 100644 android/app/src/main/java/de/streborn/android/Core.java
+ create mode 100644 android/app/src/main/java/de/streborn/android/ProcessCore.java
+ create mode 100755 android/build-apk.sh
+ create mode 100644 android/wailsshim/process.go
+
+diff --git a/android/README.md b/android/README.md
+index 7030b969..81bfbb1f 100644
+--- a/android/README.md
++++ b/android/README.md
+@@ -59,7 +59,8 @@ app did not compile for an ARM Linux desktop either. It now uses
+ | Speaker discovery | Holds a Wi-Fi `MulticastLock` so mDNS and SSDP packets reach the app. |
+ | Network interfaces | Android 11+ forbids the netlink calls behind `net.Interfaces()` (golang/go#40569). The build patches the standard library's `net` package with `go build -overlay` (`goport/overlay`), adding a bind-free `RTM_GETADDR` + `ioctl` fallback. Every caller, including zeroconf, works unchanged. |
+ | DNS | Android has no `/etc/resolv.conf`, so resolvers pinned to the pure-Go path (the update client's) would query `127.0.0.1`. The host writes the current network's DNS servers to a private `resolv.conf` and the overlay points Go at it. |
+-| Speaker setup AP | While Wi-Fi is connected the process is bound to it. A new speaker's own access point has no internet, so Android would otherwise send the core's traffic over mobile data. |
++| Speaker setup AP | A new speaker's own access point has no internet, so Android keeps mobile data as the default network. The app binds itself to Wi-Fi, which covers the WebView's requests but not the Go core's, because Go's raw socket calls bypass the network choice Android applies inside Bionic. **For that one setup step, turn mobile data off.** Normal use on a home network is unaffected. |
++| Time zone | Go reads local time from `TZ` or `/etc/localtime`, and Android has neither. The app passes the phone's zone in `TZ`, so alarms and clock sync use local time. |
+ | Save / open file | Wails "save to path" becomes: the method writes to a private staging file, and when the call returns the system "Save as" picker copies it to wherever the user chooses. "Open" uses the system picker and hands Go a private copy. |
+ | Closing mid-update | Back asks the core first (the desktop `OnBeforeClose`), which offers to stay while an install or update runs. The screen is kept on while one runs. |
+ | App self-update | Hidden: the desktop updater has no Android build to fetch. Speaker agent updates are unaffected. |
+@@ -88,6 +89,28 @@ Release signing: set `STR_KEYSTORE`, `STR_KEYSTORE_PASSWORD`, `STR_KEY_ALIAS`
+ and `STR_KEY_PASSWORD`. Without them the release APK is signed with the debug
+ key. That is fine for testing but not for distribution.
+ 
++## Building without Gradle or the NDK
++
++`android/build-apk.sh` builds an installable arm64 APK with only Go, Node, a
++JDK and the SDK's command-line tools. On Debian or Ubuntu those are
++`apt install aapt dalvik-exchange zipalign apksigner`. It needs no Gradle, no
++Maven repository and no NDK:
++
++* The core is built as a plain android/arm64 executable (Go needs no cgo for
++  that) and shipped as `lib/arm64-v8a/libstrcore.so`, so Android installs it
++  executable. The app starts it as a child process (`ProcessCore.java`). It
++  talks to it over a loopback port with a random per-launch token
++  (`android/wailsshim/process.go`), and the core exits when the app process
++  does.
++* `Core.java` picks the mode at startup: JNI when `libstr.so` is present,
++  process mode otherwise. Everything above it is identical in both.
++* The app has no dependencies beyond the platform, so `aapt`, `javac`, `dx`,
++  `zipalign` and `apksigner` assemble it directly.
++
++Signing works as it does for `build.sh` (the `STR_KEYSTORE*` variables). Without
++those variables it creates `~/.android/str-local.keystore` once and reuses it,
++so later builds install as updates. Keep that file safe.
++
+ ## Trying the Android build in a browser
+ 
+ On a desktop OS the stand-in's `wails.Run` serves the frontend with the
+@@ -113,6 +136,8 @@ so it works against real speakers too.
+ 
+ ## Open items
+ 
++* Process mode currently builds arm64 only, which covers practically every
++  phone sold since 2017. The JNI build covers the other ABIs.
+ * Verified on real hardware: not yet. The bridge, overlay and UI were
+   exercised against the real core, but no APK has run on a phone against a
+   speaker.
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index c2234be3..52c8ff05 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -57,8 +57,9 @@ android {
+ 
+     packaging {
+         jniLibs {
+-            // libstr.so is Go; nothing to gain from extracting it.
+-            useLegacyPackaging false
++            // Extracted to disk: in process mode libstrcore.so is an executable
++            // the app starts, which only works from the extracted copy.
++            useLegacyPackaging true
+         }
+     }
+ 
+@@ -71,7 +72,6 @@ android {
+     }
+ }
+ 
+-dependencies {
+-    implementation 'androidx.webkit:webkit:1.14.0'
+-    implementation 'androidx.annotation:annotation:1.9.1'
+-}
++// No dependencies beyond the platform: the app is a WebView host and a thin
++// bridge, and keeping it that way lets android/build-apk.sh build it without
++// Gradle or any Maven repository.
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 0e44a208..c4daacdd 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -9,6 +9,7 @@
+ 
+     <application
+         android:allowBackup="true"
++        android:extractNativeLibs="true"
+         android:icon="@mipmap/ic_launcher"
+         android:label="@string/app_name"
+         android:networkSecurityConfig="@xml/network_security_config"
+diff --git a/android/app/src/main/java/de/streborn/android/Core.java b/android/app/src/main/java/de/streborn/android/Core.java
+new file mode 100644
+index 00000000..f94c5894
+--- /dev/null
++++ b/android/app/src/main/java/de/streborn/android/Core.java
+@@ -0,0 +1,89 @@
++package de.streborn.android;
++
++import android.content.Context;
++import android.util.Log;
++
++import java.io.File;
++import java.util.Map;
++
++/**
++ * The Go core, whichever way it was built.
++ *
++ * <ul>
++ *   <li><b>JNI</b>: {@code libstr.so}, the desktop app built with
++ *       {@code -buildmode=c-shared} (needs the NDK; the Gradle build).
++ *   <li><b>Process</b>: {@code libstrcore.so}, the desktop app built as a plain
++ *       android/arm64 executable without cgo (no NDK; android/build-apk.sh),
++ *       run as a child process and reached over a private loopback port.
++ * </ul>
++ *
++ * <p>Both offer the same operations, so nothing above this class knows which
++ * one is running.
++ */
++final class Core {
++    private static final String TAG = "STR";
++    private static volatile boolean jni;
++    private static volatile boolean started;
++    // Process mode cannot ask the core whether an update is running, but every
++    // SetOTARunning call passes through here, so it is tracked on the way.
++    private static volatile boolean otaRunning;
++
++    private Core() {}
++
++    static synchronized void start(Context ctx, String configJson, Map<String, String> env) {
++        if (started) return;
++        File exe = new File(ctx.getApplicationInfo().nativeLibraryDir, "libstrcore.so");
++        if (exe.exists()) {
++            ProcessCore.start(exe, env);
++        } else {
++            System.loadLibrary("str");
++            jni = true;
++            new Thread(new Runnable() { @Override public void run() { GoBridge.start(GoBridge.utf8(configJson)); } }, "str-start").start();
++        }
++        started = true;
++        Log.i(TAG, "core started (" + (jni ? "JNI" : "process") + ")");
++    }
++
++    static String call(String method, String argsJson) {
++        if ("SetOTARunning".equals(method) && argsJson != null) {
++            otaRunning = argsJson.contains("true");
++        }
++        if (jni) return GoBridge.str(GoBridge.call(GoBridge.utf8(method), GoBridge.utf8(argsJson)));
++        return ProcessCore.call(method, argsJson);
++    }
++
++    /** Next event or host request as JSON, or null after the timeout. */
++    static String nextEvent(int timeoutMs) {
++        if (jni) return GoBridge.str(GoBridge.nextEvent(timeoutMs));
++        return ProcessCore.nextEvent(timeoutMs);
++    }
++
++    static void hostReply(long id, String payloadJson) {
++        if (jni) {
++            GoBridge.hostReply(id, GoBridge.utf8(payloadJson));
++        } else {
++            ProcessCore.hostReply(id, payloadJson);
++        }
++    }
++
++    static void emit(String name, String dataJson) {
++        if (jni) {
++            GoBridge.emit(GoBridge.utf8(name), GoBridge.utf8(dataJson));
++        } else {
++            ProcessCore.emit(name, dataJson);
++        }
++    }
++
++    /** True when leaving now should be refused (an update is running and the user chose to stay). */
++    static boolean beforeClose() {
++        if (jni) return GoBridge.beforeClose();
++        return ProcessCore.beforeClose();
++    }
++
++    /** True while an install or update runs. */
++    static boolean busy() {
++        if (!started) return false;
++        if (jni) return GoBridge.busy();
++        return otaRunning;
++    }
++}
+diff --git a/android/app/src/main/java/de/streborn/android/HostBridge.java b/android/app/src/main/java/de/streborn/android/HostBridge.java
+index 20afe18b..f8795cbd 100644
+--- a/android/app/src/main/java/de/streborn/android/HostBridge.java
++++ b/android/app/src/main/java/de/streborn/android/HostBridge.java
+@@ -6,6 +6,7 @@ import android.content.ActivityNotFoundException;
+ import android.content.ClipData;
+ import android.content.ClipboardManager;
+ import android.content.Context;
++import android.content.DialogInterface;
+ import android.content.Intent;
+ import android.database.Cursor;
+ import android.net.Uri;
+@@ -38,7 +39,7 @@ import java.util.concurrent.Executors;
+  *       {@code window.go} and {@code window.runtime} on top of it.
+  *   <li>Runs the event pump that drains Go's queue: frontend events are replayed
+  *       into the page, host requests (pickers, dialogs, URLs, clipboard) are
+- *       carried out here and answered with {@link GoBridge#hostReply}.
++ *       carried out here and answered with {@link Core#hostReply}.
+  * </ul>
+  */
+ final class HostBridge {
+@@ -69,34 +70,34 @@ final class HostBridge {
+ 
+     @JavascriptInterface
+     public void call(final int id, final String method, final String argsJson) {
+-        calls.execute(() -> {
++        calls.execute(new Runnable() { @Override public void run() {
+             String env;
+             try {
+-                env = GoBridge.str(GoBridge.call(GoBridge.utf8(method), GoBridge.utf8(argsJson)));
++                env = Core.call(method, argsJson);
+             } catch (Throwable t) {
+                 env = errorEnvelope(String.valueOf(t));
+             }
+             if (env == null) env = errorEnvelope("no answer from the app core");
+             js("window.__strReply(" + id + "," + env + ")");
+-        });
++        } });
+     }
+ 
+     @JavascriptInterface
+     public void emit(String name, String dataJson) {
+-        calls.execute(() -> GoBridge.emit(GoBridge.utf8(name), GoBridge.utf8(dataJson)));
++        calls.execute(new Runnable() { @Override public void run() { Core.emit(name, dataJson); } });
+     }
+ 
+     @JavascriptInterface
+     public void openURL(String url) {
+-        ui.post(() -> openExternal(url));
++        ui.post(new Runnable() { @Override public void run() { openExternal(url); } });
+     }
+ 
+     @JavascriptInterface
+     public void clipboardSet(String text) {
+-        ui.post(() -> {
++        ui.post(new Runnable() { @Override public void run() {
+             ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+             if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("ST Reborn", text));
+-        });
++        } });
+     }
+ 
+     @JavascriptInterface
+@@ -109,7 +110,7 @@ final class HostBridge {
+ 
+     @JavascriptInterface
+     public void quit() {
+-        ui.post(() -> activity.moveTaskToBack(true));
++        ui.post(new Runnable() { @Override public void run() { activity.moveTaskToBack(true); } });
+     }
+ 
+     // ---- event pump ----------------------------------------------------------------
+@@ -117,11 +118,11 @@ final class HostBridge {
+     void startPump() {
+         if (pumping) return;
+         pumping = true;
+-        Thread t = new Thread(() -> {
++        Thread t = new Thread(new Runnable() { @Override public void run() {
+             while (pumping) {
+                 String ev;
+                 try {
+-                    ev = GoBridge.str(GoBridge.nextEvent(1000));
++                    ev = Core.nextEvent(1000);
+                 } catch (Throwable th) {
+                     Log.e(TAG, "event pump", th);
+                     return;
+@@ -138,7 +139,7 @@ final class HostBridge {
+                     Log.w(TAG, "bad event from core: " + e);
+                 }
+             }
+-        }, "str-events");
++        } }, "str-events");
+         t.setDaemon(true);
+         t.start();
+     }
+@@ -151,7 +152,7 @@ final class HostBridge {
+         final long id = o.optLong("id");
+         final String op = o.optString("op");
+         final JSONObject args = o.optJSONObject("args") != null ? o.optJSONObject("args") : new JSONObject();
+-        ui.post(() -> {
++        ui.post(new Runnable() { @Override public void run() {
+             switch (op) {
+                 case "openURL":
+                     openExternal(args.optString("url"));
+@@ -184,7 +185,7 @@ final class HostBridge {
+                     Log.w(TAG, "unknown host op " + op);
+                     if (id != 0) reply(id, new JSONObject());
+             }
+-        });
++        } });
+     }
+ 
+     // ---- host operations -------------------------------------------------------------
+@@ -206,27 +207,27 @@ final class HostBridge {
+         AlertDialog.Builder b = new AlertDialog.Builder(activity)
+                 .setTitle(a.optString("title"))
+                 .setMessage(a.optString("message"))
+-                .setOnCancelListener(d -> reply(id, obj("button", cancel)));
++                .setOnCancelListener(new DialogInterface.OnCancelListener() { @Override public void onCancel(DialogInterface d) { reply(id, obj("button", cancel)); } });
+         // AlertDialog has three button slots. Wails dialogs in STR use one or two.
+         if (buttons != null && buttons.length() > 0) {
+             final String b0 = buttons.optString(0);
+             if (buttons.length() == 1) {
+-                b.setPositiveButton(b0, (d, w) -> reply(id, obj("button", b0)));
++                b.setPositiveButton(b0, new DialogInterface.OnClickListener() { @Override public void onClick(DialogInterface d, int w) { reply(id, obj("button", b0)); } });
+             } else {
+                 final String b1 = buttons.optString(1);
+                 // The cancel/default choice goes on the negative (left) slot.
+                 String neg = b0, pos = b1;
+                 if (b1.equals(cancel)) { neg = b1; pos = b0; }
+                 final String fNeg = neg, fPos = pos;
+-                b.setNegativeButton(fNeg, (d, w) -> reply(id, obj("button", fNeg)));
+-                b.setPositiveButton(fPos, (d, w) -> reply(id, obj("button", fPos)));
++                b.setNegativeButton(fNeg, new DialogInterface.OnClickListener() { @Override public void onClick(DialogInterface d, int w) { reply(id, obj("button", fNeg)); } });
++                b.setPositiveButton(fPos, new DialogInterface.OnClickListener() { @Override public void onClick(DialogInterface d, int w) { reply(id, obj("button", fPos)); } });
+                 if (buttons.length() > 2) {
+                     final String b2 = buttons.optString(2);
+-                    b.setNeutralButton(b2, (d, w) -> reply(id, obj("button", b2)));
++                    b.setNeutralButton(b2, new DialogInterface.OnClickListener() { @Override public void onClick(DialogInterface d, int w) { reply(id, obj("button", b2)); } });
+                 }
+             }
+         } else {
+-            b.setPositiveButton(android.R.string.ok, (d, w) -> reply(id, obj("button", "OK")));
++            b.setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() { @Override public void onClick(DialogInterface d, int w) { reply(id, obj("button", "OK")); } });
+         }
+         b.show();
+     }
+@@ -272,7 +273,7 @@ final class HostBridge {
+             pendingSave = null;
+             if (a == null || resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return true;
+             final Uri dest = data.getData();
+-            calls.execute(() -> {
++            calls.execute(new Runnable() { @Override public void run() {
+                 File src = new File(a.optString("path"));
+                 try (InputStream in = new FileInputStream(src);
+                      OutputStream out = activity.getContentResolver().openOutputStream(dest, "wt")) {
+@@ -285,7 +286,7 @@ final class HostBridge {
+                     //noinspection ResultOfMethodCallIgnored
+                     src.delete();
+                 }
+-            });
++            } });
+             return true;
+         }
+         if (requestCode == REQ_OPEN) {
+@@ -298,7 +299,7 @@ final class HostBridge {
+                 return true;
+             }
+             final Uri src = data.getData();
+-            calls.execute(() -> {
++            calls.execute(new Runnable() { @Override public void run() {
+                 String name = sanitize(displayName(src, "import"));
+                 File dir = new File(target == null || target.isEmpty()
+                         ? activity.getCacheDir().getPath() : target);
+@@ -313,7 +314,7 @@ final class HostBridge {
+                 } catch (IOException | SecurityException e) {
+                     reply(id, obj("error", String.valueOf(e.getMessage())));
+                 }
+-            });
++            } });
+             return true;
+         }
+         return false;
+@@ -322,16 +323,16 @@ final class HostBridge {
+     // ---- helpers -------------------------------------------------------------------------
+ 
+     private void js(String script) {
+-        ui.post(() -> webView.evaluateJavascript(script, null));
++        ui.post(new Runnable() { @Override public void run() { webView.evaluateJavascript(script, null); } });
+     }
+ 
+     private void toast(String msg) {
+-        ui.post(() -> Toast.makeText(activity, msg, Toast.LENGTH_LONG).show());
++        ui.post(new Runnable() { @Override public void run() { Toast.makeText(activity, msg, Toast.LENGTH_LONG).show(); } });
+     }
+ 
+     private static void reply(long id, JSONObject payload) {
+         if (id == 0) return;
+-        GoBridge.hostReply(id, GoBridge.utf8(payload.toString()));
++        Core.hostReply(id, payload.toString());
+     }
+ 
+     private static JSONObject obj(String k, String v) {
+diff --git a/android/app/src/main/java/de/streborn/android/MainActivity.java b/android/app/src/main/java/de/streborn/android/MainActivity.java
+index e2b002f6..d57cbf28 100644
+--- a/android/app/src/main/java/de/streborn/android/MainActivity.java
++++ b/android/app/src/main/java/de/streborn/android/MainActivity.java
+@@ -30,13 +30,15 @@ import android.webkit.WebView;
+ import android.webkit.WebViewClient;
+ import android.widget.FrameLayout;
+ 
+-import androidx.annotation.NonNull;
+-import androidx.webkit.WebViewAssetLoader;
+ 
+ import org.json.JSONException;
+ import org.json.JSONObject;
+ 
+ import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.HashMap;
++import java.util.Map;
+ import java.net.InetAddress;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+@@ -73,7 +75,7 @@ public class MainActivity extends Activity {
+         public void run() {
+             boolean busy = false;
+             try {
+-                busy = coreStarted && GoBridge.busy();
++                busy = Core.busy();
+             } catch (Throwable ignored) {
+                 // core not loaded
+             }
+@@ -127,25 +129,12 @@ public class MainActivity extends Activity {
+         s.setUserAgentString(s.getUserAgentString() + " STReborn-Android/" + BuildConfig.VERSION_NAME);
+         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+ 
+-        final WebViewAssetLoader assets = new WebViewAssetLoader.Builder()
+-                .setDomain(ORIGIN_HOST)
+-                .addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this))
+-                .build();
+-
+         webView.setWebViewClient(new WebViewClient() {
+             @Override
+             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                 Uri u = req.getUrl();
+-                if (ORIGIN_HOST.equals(u.getHost())) {
+-                    String p = u.getPath();
+-                    if (p == null || p.isEmpty() || "/".equals(p)) {
+-                        u = u.buildUpon().path("/index.html").build();
+-                    }
+-                    // The built frontend is copied under assets/web/.
+-                    Uri mapped = u.buildUpon().path("/web" + u.getPath()).build();
+-                    return assets.shouldInterceptRequest(mapped);
+-                }
+-                return null;
++                if (!"https".equals(u.getScheme()) || !ORIGIN_HOST.equals(u.getHost())) return null;
++                return serveAsset(u.getPath());
+             }
+ 
+             @Override
+@@ -173,6 +162,50 @@ public class MainActivity extends Activity {
+         }
+     }
+ 
++    /**
++     * Serves the built frontend, copied into the APK under assets/web/, for
++     * https://wails.localhost/. A handful of lines rather than a library: the
++     * page only ever asks for its own static files.
++     */
++    private WebResourceResponse serveAsset(String path) {
++        if (path == null || path.isEmpty() || "/".equals(path)) path = "/index.html";
++        if (path.contains("..")) return notFound();
++        try {
++            InputStream in = getAssets().open("web" + path);
++            WebResourceResponse r = new WebResourceResponse(mimeFor(path), "UTF-8", in);
++            Map<String, String> h = new HashMap<>();
++            h.put("Cache-Control", "no-cache");
++            r.setResponseHeaders(h);
++            return r;
++        } catch (IOException e) {
++            return notFound();
++        }
++    }
++
++    private static WebResourceResponse notFound() {
++        WebResourceResponse r = new WebResourceResponse("text/plain", "UTF-8",
++                new java.io.ByteArrayInputStream(new byte[0]));
++        r.setStatusCodeAndReasonPhrase(404, "Not Found");
++        return r;
++    }
++
++    private static String mimeFor(String path) {
++        String p = path.toLowerCase(java.util.Locale.ROOT);
++        if (p.endsWith(".html")) return "text/html";
++        if (p.endsWith(".js") || p.endsWith(".mjs")) return "text/javascript";
++        if (p.endsWith(".css")) return "text/css";
++        if (p.endsWith(".svg")) return "image/svg+xml";
++        if (p.endsWith(".png")) return "image/png";
++        if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
++        if (p.endsWith(".webp")) return "image/webp";
++        if (p.endsWith(".json") || p.endsWith(".webmanifest")) return "application/json";
++        if (p.endsWith(".woff2")) return "font/woff2";
++        if (p.endsWith(".woff")) return "font/woff";
++        if (p.endsWith(".ttf")) return "font/ttf";
++        if (p.endsWith(".wasm")) return "application/wasm";
++        return "application/octet-stream";
++    }
++
+     /**
+      * Loads libstr.so and starts the Go core, once per process. The environment
+      * must be in place before the library loads: the Go runtime snapshots it
+@@ -184,17 +217,27 @@ public class MainActivity extends Activity {
+         File files = getFilesDir();
+         File cache = getCacheDir();
+         File resolv = new File(files, "resolv.conf");
+-        setenv("HOME", files.getAbsolutePath());
+-        setenv("XDG_CONFIG_HOME", new File(files, "config").getAbsolutePath());
+-        setenv("XDG_DATA_HOME", new File(files, "data").getAbsolutePath());
+-        setenv("XDG_CACHE_HOME", cache.getAbsolutePath());
+-        setenv("TMPDIR", new File(cache, "tmp").getAbsolutePath());
+-        setenv("STR_RESOLV_CONF", resolv.getAbsolutePath());
+-        if (BuildConfig.DEBUG) setenv("STR_DEBUG", "1");
++        Map<String, String> env = new HashMap<>();
++        env.put("HOME", files.getAbsolutePath());
++        env.put("XDG_CONFIG_HOME", new File(files, "config").getAbsolutePath());
++        env.put("XDG_DATA_HOME", new File(files, "data").getAbsolutePath());
++        env.put("XDG_CACHE_HOME", cache.getAbsolutePath());
++        env.put("TMPDIR", new File(cache, "tmp").getAbsolutePath());
++        env.put("STR_RESOLV_CONF", resolv.getAbsolutePath());
++        // Go finds local time through TZ or /etc/localtime, and Android has
++        // neither, so without this the core runs on UTC: speaker alarms would
++        // fire at the wrong hour and clock sync would set the wrong time.
++        env.put("TZ", java.util.TimeZone.getDefault().getID());
++        if (BuildConfig.DEBUG) env.put("STR_DEBUG", "1");
++        for (String d : new String[] {"XDG_CONFIG_HOME", "XDG_DATA_HOME", "TMPDIR"}) {
++            //noinspection ResultOfMethodCallIgnored
++            new File(env.get(d)).mkdirs();
++        }
++        // JNI mode reads these from the process environment, process mode from
++        // the child's; set both.
++        for (Map.Entry<String, String> e : env.entrySet()) setenv(e.getKey(), e.getValue());
+         writeResolvConf(null);
+ 
+-        System.loadLibrary("str");
+-
+         final JSONObject cfg = new JSONObject();
+         try {
+             cfg.put("filesDir", files.getAbsolutePath());
+@@ -203,11 +246,7 @@ public class MainActivity extends Activity {
+         } catch (JSONException ignored) {
+             // cannot fail
+         }
+-        // startup() runs synchronously and touches the network; keep it off
+-        // the UI thread. Calls that arrive before it finishes are fine: the
+-        // desktop app is written for Wails, which dispatches them the same way.
+-        Thread t = new Thread(() -> GoBridge.start(GoBridge.utf8(cfg.toString())), "str-start");
+-        t.start();
++        Core.start(this, cfg.toString(), env);
+         coreStarted = true;
+     }
+ 
+@@ -222,13 +261,13 @@ public class MainActivity extends Activity {
+     /**
+      * Two jobs, both about which network the core talks over.
+      *
+-     * <p>Wi-Fi first: the core only ever wants the LAN the speakers are on. When
+-     * that Wi-Fi has no internet, which is exactly the case while a new speaker
+-     * is set up through its own access point, Android keeps mobile data as the
+-     * default network, and an app's sockets follow the default network's routing
+-     * table, so packets for the speaker would leave over cellular. Binding the
+-     * process to the Wi-Fi network while one is connected makes the phone behave
+-     * like the desktop does on the same network.
++     * <p>Wi-Fi first, for the WebView: when the Wi-Fi has no internet (a new
++     * speaker's own setup access point) Android keeps mobile data as the default
++     * network, and the page's direct requests to the speaker would leave over
++     * cellular. Binding the process to the Wi-Fi network fixes that for the
++     * WebView. It does NOT reach the Go core: Go makes raw socket system calls,
++     * and Android applies a process's network choice inside Bionic's connect().
++     * So for that one setup case, mobile data has to be off (android/README.md).
+      *
+      * <p>DNS: keeps the resolv.conf that Go's pure-Go resolver reads in step with
+      * the network in use (see android/goport/overlay); Android has no
+@@ -242,7 +281,7 @@ public class MainActivity extends Activity {
+ 
+         netCallback = new ConnectivityManager.NetworkCallback() {
+             @Override
+-            public void onLinkPropertiesChanged(@NonNull Network network, @NonNull LinkProperties lp) {
++            public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
+                 if (boundWifi == null) writeResolvConf(lp);
+             }
+         };
+@@ -254,7 +293,7 @@ public class MainActivity extends Activity {
+                 .build();
+         wifiCallback = new ConnectivityManager.NetworkCallback() {
+             @Override
+-            public void onAvailable(@NonNull Network network) {
++            public void onAvailable(Network network) {
+                 boundWifi = network;
+                 cm.bindProcessToNetwork(network);
+                 LinkProperties lp = cm.getLinkProperties(network);
+@@ -263,12 +302,12 @@ public class MainActivity extends Activity {
+             }
+ 
+             @Override
+-            public void onLinkPropertiesChanged(@NonNull Network network, @NonNull LinkProperties lp) {
++            public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
+                 if (network.equals(boundWifi)) writeResolvConf(lp);
+             }
+ 
+             @Override
+-            public void onLost(@NonNull Network network) {
++            public void onLost(Network network) {
+                 if (!network.equals(boundWifi)) return;
+                 boundWifi = null;
+                 cm.bindProcessToNetwork(null);
+@@ -315,7 +354,7 @@ public class MainActivity extends Activity {
+ 
+     /** Keeps the page clear of the status and navigation bars (edge-to-edge on Android 15+). */
+     private void applyInsets(View root) {
+-        root.setOnApplyWindowInsetsListener((v, insets) -> {
++        root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() { @Override public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+             int l, t, r, b;
+             if (Build.VERSION.SDK_INT >= 30) {
+                 android.graphics.Insets i = insets.getInsets(
+@@ -329,7 +368,7 @@ public class MainActivity extends Activity {
+             }
+             v.setPadding(l, t, r, b);
+             return insets;
+-        });
++        } });
+     }
+ 
+     @Override
+@@ -345,7 +384,7 @@ public class MainActivity extends Activity {
+     }
+ 
+     @Override
+-    protected void onSaveInstanceState(@NonNull Bundle out) {
++    protected void onSaveInstanceState(Bundle out) {
+         super.onSaveInstanceState(out);
+         if (webView != null) webView.saveState(out);
+     }
+@@ -357,15 +396,15 @@ public class MainActivity extends Activity {
+         // is the desktop's "close window": ask the core first, which refuses
+         // (after asking the user) while a speaker is mid-update. The app is then
+         // only moved to the background, so a running core keeps its state.
+-        new Thread(() -> {
++        new Thread(new Runnable() { @Override public void run() {
+             boolean prevent;
+             try {
+-                prevent = GoBridge.beforeClose();
++                prevent = Core.beforeClose();
+             } catch (Throwable t) {
+                 prevent = false;
+             }
+-            if (!prevent) ui.post(() -> moveTaskToBack(true));
+-        }, "str-close").start();
++            if (!prevent) ui.post(new Runnable() { @Override public void run() { moveTaskToBack(true); } });
++        } }, "str-close").start();
+     }
+ 
+     @SuppressWarnings("deprecation")
+diff --git a/android/app/src/main/java/de/streborn/android/ProcessCore.java b/android/app/src/main/java/de/streborn/android/ProcessCore.java
+new file mode 100644
+index 00000000..16bfa581
+--- /dev/null
++++ b/android/app/src/main/java/de/streborn/android/ProcessCore.java
+@@ -0,0 +1,206 @@
++package de.streborn.android;
++
++import android.util.Log;
++
++import org.json.JSONObject;
++
++import java.io.BufferedReader;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStream;
++import java.net.HttpURLConnection;
++import java.net.Proxy;
++import java.net.URL;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.security.SecureRandom;
++import java.util.Map;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * The Go core as a child process (android/wailsshim/process.go has the other
++ * half of the protocol).
++ *
++ * <p>The core listens on a loopback port it picks itself and announces it on
++ * stdout. Every request carries a random per-launch token, so other apps on
++ * the device, which can reach loopback ports too, cannot drive it. The
++ * process's stdin stays open for as long as this app process lives; the core
++ * exits when it reaches EOF, so it never outlives the app.
++ */
++final class ProcessCore {
++    private static final String TAG = "STR";
++
++    private static final CountDownLatch ready = new CountDownLatch(1);
++    private static volatile String base; // http://127.0.0.1:PORT
++    private static volatile String token;
++    private static Process process;
++    @SuppressWarnings("unused") // held only so the pipe stays open
++    private static OutputStream lifeline;
++
++    private ProcessCore() {}
++
++    static void start(File exe, Map<String, String> env) {
++        byte[] t = new byte[24];
++        new SecureRandom().nextBytes(t);
++        StringBuilder sb = new StringBuilder();
++        for (byte b : t) sb.append(String.format("%02x", b));
++        token = sb.toString();
++
++        ProcessBuilder pb = new ProcessBuilder(exe.getAbsolutePath());
++        pb.environment().putAll(env);
++        pb.environment().put("STR_BRIDGE_TOKEN", token);
++        pb.environment().put("STR_BRIDGE_ADDR", "127.0.0.1:0");
++        pb.redirectErrorStream(true);
++        try {
++            process = pb.start();
++        } catch (IOException e) {
++            Log.e(TAG, "could not start the core", e);
++            return;
++        }
++        lifeline = process.getOutputStream();
++        final InputStream out = process.getInputStream();
++        Thread reader = new Thread(new Runnable() { @Override public void run() {
++            try (BufferedReader r = new BufferedReader(new InputStreamReader(out, StandardCharsets.UTF_8))) {
++                String line;
++                while ((line = r.readLine()) != null) {
++                    if (base == null && line.startsWith("STR_BRIDGE_LISTENING ")) {
++                        base = "http://" + line.substring("STR_BRIDGE_LISTENING ".length()).trim();
++                        ready.countDown();
++                        Log.i(TAG, "core listening on " + base);
++                    } else {
++                        Log.i(TAG, "core: " + line);
++                    }
++                }
++            } catch (IOException ignored) {
++                // process ended
++            }
++            Log.w(TAG, "core process ended");
++        } }, "str-core-log");
++        reader.setDaemon(true);
++        reader.start();
++    }
++
++    private static boolean awaitReady() {
++        try {
++            return ready.await(30, TimeUnit.SECONDS) && base != null;
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            return false;
++        }
++    }
++
++    static String call(String method, String argsJson) {
++        if (!awaitReady()) return error("the app core did not start");
++        String args = argsJson == null || argsJson.trim().isEmpty() ? "[]" : argsJson;
++        String body = "{\"method\":" + JSONObject.quote(method) + ",\"args\":" + args + "}";
++        try {
++            Response r = request("POST", "/call", body, 0);
++            if (r.code == 200) return r.body;
++            return error("app core answered " + r.code + ": " + r.body);
++        } catch (IOException e) {
++            return error("app core unreachable: " + e.getMessage());
++        }
++    }
++
++    static String nextEvent(int timeoutMs) {
++        if (!awaitReady()) return null;
++        try {
++            Response r = request("GET", "/next?ms=" + timeoutMs, null, timeoutMs + 15000);
++            return r.code == 200 ? r.body : null;
++        } catch (IOException e) {
++            sleepQuietly(500); // core restarting or gone; do not spin
++            return null;
++        }
++    }
++
++    static void hostReply(long id, String payload) {
++        if (!awaitReady()) return;
++        try {
++            request("POST", "/hostreply?id=" + id, payload, 15000);
++        } catch (IOException e) {
++            Log.w(TAG, "hostReply", e);
++        }
++    }
++
++    static void emit(String name, String dataJson) {
++        if (!awaitReady()) return;
++        try {
++            request("POST", "/emit?name=" + URLEncoder.encode(name, "UTF-8"), dataJson, 15000);
++        } catch (IOException e) {
++            Log.w(TAG, "emit", e);
++        }
++    }
++
++    static boolean beforeClose() {
++        if (!awaitReady()) return false;
++        try {
++            // May show a dialog and wait for the user; no read timeout.
++            return "1".equals(request("POST", "/beforeclose", "", 0).body.trim());
++        } catch (IOException e) {
++            return false;
++        }
++    }
++
++    // ---- HTTP -----------------------------------------------------------------------
++
++    private static final class Response {
++        final int code;
++        final String body;
++
++        Response(int code, String body) {
++            this.code = code;
++            this.body = body;
++        }
++    }
++
++    private static Response request(String method, String path, String body, int readTimeoutMs) throws IOException {
++        HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection(Proxy.NO_PROXY);
++        try {
++            c.setRequestMethod(method);
++            c.setConnectTimeout(5000);
++            c.setReadTimeout(readTimeoutMs);
++            c.setUseCaches(false);
++            c.setRequestProperty("X-STR-Token", token);
++            if (body != null) {
++                byte[] b = body.getBytes(StandardCharsets.UTF_8);
++                c.setDoOutput(true);
++                c.setFixedLengthStreamingMode(b.length);
++                c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
++                try (OutputStream os = c.getOutputStream()) {
++                    os.write(b);
++                }
++            }
++            int code = c.getResponseCode();
++            InputStream in = code >= 400 ? c.getErrorStream() : (code == 204 ? null : c.getInputStream());
++            return new Response(code, in == null ? "" : readAll(in));
++        } finally {
++            c.disconnect();
++        }
++    }
++
++    private static String readAll(InputStream in) throws IOException {
++        try (InputStream i = in) {
++            ByteArrayOutputStream bo = new ByteArrayOutputStream();
++            byte[] buf = new byte[16384];
++            int n;
++            while ((n = i.read(buf)) > 0) bo.write(buf, 0, n);
++            return new String(bo.toByteArray(), StandardCharsets.UTF_8);
++        }
++    }
++
++    private static String error(String msg) {
++        return "{\"ok\":false,\"error\":" + JSONObject.quote(msg) + "}";
++    }
++
++    private static void sleepQuietly(long ms) {
++        try {
++            Thread.sleep(ms);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++    }
++}
+diff --git a/android/build-apk.sh b/android/build-apk.sh
+new file mode 100755
+index 00000000..e22f5108
+--- /dev/null
++++ b/android/build-apk.sh
+@@ -0,0 +1,207 @@
++#!/usr/bin/env bash
++# Build an installable ST Reborn APK without Gradle, Maven or the NDK.
++#
++#   android/build-apk.sh
++#
++# This is the "process mode" build (android/wailsshim/process.go): the Go core
++# is a plain android/arm64 executable, which Go builds without cgo, so no NDK is
++# needed; and the app has no dependencies beyond the platform, so the APK can be
++# put together with the SDK's own command-line tools instead of Gradle. Use it
++# where Google's Maven and SDK servers are out of reach. android/build.sh (the
++# JNI build through Gradle) is the regular route.
++#
++# Needs: Go, Node/npm, a JDK (javac, keytool), and the Android build tools
++# aapt, dx (dalvik-exchange), zipalign and apksigner. On Debian or Ubuntu:
++#   apt install aapt dalvik-exchange zipalign apksigner
++# plus an android.jar for the platform (ANDROID_JAR; the default downloads the
++# API 35 one from github.com/Sable/android-platforms).
++#
++# Signing: STR_KEYSTORE / STR_KEYSTORE_PASSWORD / STR_KEY_ALIAS /
++# STR_KEY_PASSWORD, as for build.sh. Without them a local key is created under
++# ~/.android/str-local.keystore and reused, so later builds install as updates.
++set -euo pipefail
++
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++APPDIR="$ROOT/desktop-app"
++SRC="$HERE/app/src/main"
++GO="${GO:-go}"
++
++VERSION="${VERSION:-$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)}"
++BUILD_STAMP="${BUILD_STAMP:-$(date '+%Y-%m-%d-%H%M')}"
++APP_MODFILE="${STR_APP_MODFILE:-$APPDIR/go.android.mod}"
++ROOT_MODFILE="${STR_ROOT_MODFILE:-$ROOT/go.mod}"
++MIN_SDK=26
++TARGET_SDK=35
++
++OUT="$HERE/app/build/apk-process"
++WORK="$OUT/work"
++rm -rf "$WORK"
++mkdir -p "$WORK"
++
++log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
++need() { command -v "$1" >/dev/null || { echo "missing tool: $1 ($2)"; exit 1; }; }
++need aapt "apt install aapt"
++need zipalign "apt install zipalign"
++need apksigner "apt install apksigner"
++need javac "a JDK"
++need keytool "a JDK"
++DX="$(command -v dx || command -v dalvik-exchange || true)"
++[[ -n "$DX" ]] || { echo "missing tool: dx (apt install dalvik-exchange)"; exit 1; }
++
++# Two platform jars. Java compiles against the target API. Resources link
++# against API 33, because the legacy aapt in Debian/Ubuntu cannot parse the
++# resource table format of newer platforms; framework resource IDs are stable
++# across API levels, so this changes nothing in the result.
++fetch_jar() {
++  local api="$1" dst="$2"
++  [[ -f "$dst" ]] && return
++  log "fetching android.jar (API $api)"
++  mkdir -p "$(dirname "$dst")"
++  curl -fL -o "$dst.tmp" "https://raw.githubusercontent.com/Sable/android-platforms/master/android-$api/android.jar"
++  mv "$dst.tmp" "$dst"
++}
++ANDROID_JAR="${ANDROID_JAR:-$HOME/.cache/str-android/android-$TARGET_SDK.jar}"
++ANDROID_RES_JAR="${ANDROID_RES_JAR:-$HOME/.cache/str-android/android-33.jar}"
++fetch_jar "$TARGET_SDK" "$ANDROID_JAR"
++fetch_jar 33 "$ANDROID_RES_JAR"
++
++# Same scheme as build.sh: v0.9.95-7-gabc -> 99507.
++version_code() {
++  local v="${1#v}" maj min pat extra
++  IFS=.- read -r maj min pat extra _ <<<"$v" || true
++  [[ "$maj" =~ ^[0-9]+$ ]] || { echo 1; return; }
++  [[ "$min" =~ ^[0-9]+$ ]] || min=0
++  [[ "$pat" =~ ^[0-9]+$ ]] || pat=0
++  [[ "$extra" =~ ^[0-9]+$ ]] || extra=0
++  (( extra > 99 )) && extra=99
++  echo $(( maj * 1000000 + min * 10000 + pat * 100 + extra ))
++}
++VERSION_CODE="$(version_code "$VERSION")"
++VERSION_NAME="${VERSION#v}"
++log "version $VERSION (code $VERSION_CODE)"
++
++# ---- 1. speaker agent, engine, frontend: shared with build.sh -------------------------
++log "building the speaker agent (linux/arm, GOARM=5)"
++( cd "$ROOT" && GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 \
++    "$GO" build -modfile="$ROOT_MODFILE" -trimpath \
++    -ldflags="-s -w -X main.version=$VERSION -X main.buildStamp=$BUILD_STAMP" \
++    -o "$WORK/streborn-armv7l" ./cmd/agent )
++
++ENGINE="$APPDIR/agentbin/go-librespot-armv7l"
++if [[ "${WITH_ENGINE:-0}" == 1 ]]; then
++  log "fetching go-librespot-armv7l from the latest release"
++  curl -fL -o "$WORK/go-librespot-armv7l" \
++    https://github.com/JRpersonal/streborn/releases/latest/download/go-librespot-armv7l
++  ENGINE="$WORK/go-librespot-armv7l"
++fi
++
++log "building the frontend"
++( cd "$APPDIR/frontend"
++  [[ -d node_modules ]] || npm ci --no-audit --no-fund
++  npx vite build --outDir "$WORK/assets/web" --emptyOutDir --logLevel warn )
++cp "$SRC/js/android-shim.js" "$SRC/js/android.css" "$WORK/assets/web/"
++python3 - "$WORK/assets/web/index.html" <<'PY'
++import re, sys
++p = sys.argv[1]
++s = open(p, encoding="utf-8").read()
++inject = ('<script src="./android-shim.js"></script>\n'
++          '    <link rel="stylesheet" href="./android.css"/>\n')
++if "android-shim.js" not in s:
++    s = re.sub(r'<meta content="width=device-width[^"]*" name="viewport"\s*/?>',
++               '<meta content="width=device-width, initial-scale=1.0, viewport-fit=cover" name="viewport"/>', s)
++    s = s.replace("</title>", "</title>\n    " + inject, 1)
++open(p, "w", encoding="utf-8").write(s)
++PY
++
++# ---- 2. the Go core as an android/arm64 executable --------------------------------------
++GOROOT_SRC="$("$GO" env GOROOT)/src"
++OV="$WORK/overlay"
++mkdir -p "$OV"
++sed -e 's/^func interfaceTable(/func interfaceTableNetlink(/' \
++    -e 's/syscall\.NetlinkRIB(/netlinkRIBCompat(/g' \
++    "$GOROOT_SRC/net/interface_linux.go" > "$OV/interface_linux.go"
++sed -e 's#"/etc/resolv.conf"#strResolvConfPath()#g' \
++    "$GOROOT_SRC/net/dnsclient_unix.go" > "$OV/dnsclient_unix.go"
++grep -q interfaceTableNetlink "$OV/interface_linux.go" && grep -q strResolvConfPath "$OV/dnsclient_unix.go" \
++  || { echo "net overlay: the standard library changed shape; see android/goport"; exit 1; }
++python3 - "$WORK/overlay.json" <<PY
++import json, sys
++json.dump({"Replace": {
++    "$GOROOT_SRC/net/interface_linux.go": "$OV/interface_linux.go",
++    "$GOROOT_SRC/net/dnsclient_unix.go": "$OV/dnsclient_unix.go",
++    "$GOROOT_SRC/net/interface_android_str.go": "$HERE/goport/overlay/interface_android_str.go",
++    "$APPDIR/agentbin/streborn-armv7l": "$WORK/streborn-armv7l",
++    "$APPDIR/agentbin/go-librespot-armv7l": "$ENGINE",
++}}, open(sys.argv[1], "w"), indent=1)
++PY
++
++log "building the core (android/arm64, no cgo)"
++mkdir -p "$WORK/apk/lib/arm64-v8a"
++( cd "$APPDIR" && GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
++    "$GO" build -modfile="$APP_MODFILE" -overlay="$WORK/overlay.json" -trimpath \
++    -ldflags="-s -w -X main.appVersion=$VERSION -X main.appBuild=$BUILD_STAMP" \
++    -o "$WORK/apk/lib/arm64-v8a/libstrcore.so" . )
++
++# ---- 3. resources and R.java ------------------------------------------------------------
++log "compiling resources"
++mkdir -p "$WORK/gen" "$WORK/classes"
++# Gradle injects the package from build.gradle's namespace; aapt wants it in
++# the manifest itself.
++sed 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="de.streborn.android">#' \
++  "$SRC/AndroidManifest.xml" > "$WORK/AndroidManifest.xml"
++grep -q 'package="de.streborn.android"' "$WORK/AndroidManifest.xml" || { echo "manifest: could not set package"; exit 1; }
++aapt package -f -m \
++  -M "$WORK/AndroidManifest.xml" \
++  -S "$SRC/res" \
++  -A "$WORK/assets" \
++  -I "$ANDROID_RES_JAR" \
++  -J "$WORK/gen" \
++  --min-sdk-version "$MIN_SDK" --target-sdk-version "$TARGET_SDK" \
++  --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" \
++  -0 so \
++  -F "$WORK/unsigned.apk"
++
++# Gradle generates BuildConfig; here it is written by hand.
++mkdir -p "$WORK/gen/de/streborn/android"
++cat > "$WORK/gen/de/streborn/android/BuildConfig.java" <<EOF
++package de.streborn.android;
++
++public final class BuildConfig {
++    public static final boolean DEBUG = false;
++    public static final String APPLICATION_ID = "de.streborn.android";
++    public static final String VERSION_NAME = "$VERSION_NAME";
++    public static final int VERSION_CODE = $VERSION_CODE;
++}
++EOF
++
++# ---- 4. Java -> dex --------------------------------------------------------------------
++log "compiling Java"
++find "$SRC/java" "$WORK/gen" -name '*.java' > "$WORK/sources.txt"
++javac -nowarn -Xlint:-options -source 8 -target 8 -encoding UTF-8 \
++  -bootclasspath "$ANDROID_JAR" -d "$WORK/classes" @"$WORK/sources.txt"
++"$DX" --dex --min-sdk-version="$MIN_SDK" --output="$WORK/apk/classes.dex" "$WORK/classes"
++
++# ---- 5. assemble, align, sign ----------------------------------------------------------
++log "assembling the APK"
++( cd "$WORK/apk" && zip -q -r "$WORK/unsigned.apk" classes.dex lib )
++zipalign -f -p 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
++
++if [[ -n "${STR_KEYSTORE:-}" ]]; then
++  KS="$STR_KEYSTORE"; KS_PASS="$STR_KEYSTORE_PASSWORD"; KEY_ALIAS="$STR_KEY_ALIAS"; KEY_PASS="${STR_KEY_PASSWORD:-$STR_KEYSTORE_PASSWORD}"
++else
++  KS="$HOME/.android/str-local.keystore"; KS_PASS=strlocal; KEY_ALIAS=str; KEY_PASS=strlocal
++  if [[ ! -f "$KS" ]]; then
++    log "creating a local signing key ($KS); keep it to install later builds as updates"
++    mkdir -p "$(dirname "$KS")"
++    keytool -genkeypair -noprompt -keystore "$KS" -storepass "$KS_PASS" -keypass "$KEY_PASS" \
++      -alias "$KEY_ALIAS" -keyalg RSA -keysize 3072 -validity 10000 \
++      -dname "CN=ST Reborn local build" >/dev/null 2>&1
++  fi
++fi
++FINAL="$OUT/STR-Android-$VERSION-arm64.apk"
++apksigner sign --ks "$KS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" --ks-key-alias "$KEY_ALIAS" \
++  --min-sdk-version "$MIN_SDK" --v4-signing-enabled false --out "$FINAL" "$WORK/aligned.apk"
++apksigner verify --min-sdk-version "$MIN_SDK" "$FINAL"
++( cd "$OUT" && sha256sum "$(basename "$FINAL")" > "$(basename "$FINAL").sha256" )
++log "done: $FINAL"
+diff --git a/android/gradle.properties b/android/gradle.properties
+index 691500e1..61c5fe9f 100644
+--- a/android/gradle.properties
++++ b/android/gradle.properties
+@@ -1,3 +1,2 @@
+ org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+-android.useAndroidX=true
+ android.nonTransitiveRClass=true
+diff --git a/android/wailsshim/process.go b/android/wailsshim/process.go
+new file mode 100644
+index 00000000..e6d933d3
+--- /dev/null
++++ b/android/wailsshim/process.go
+@@ -0,0 +1,149 @@
++package wails
++
++// Process mode: the core as a child process of the Android app.
++//
++// The JNI build needs the Android NDK. Process mode does not: Go builds a pure
++// executable for android/arm64 without cgo, the app ships it as a native
++// library (so Android installs it executable) and starts it, and the bridge
++// runs over a loopback HTTP connection instead of JNI. The Java side
++// (GoBridge.java, process flavour) offers the same calls either way, so the
++// WebView, the shim and everything above them are identical.
++//
++// Protocol (every request carries X-STR-Token; anything else gets 403):
++//
++//	POST /call        {"method": "...", "args": [...]}  -> envelope JSON
++//	GET  /next?ms=N   next event or host request, 204 when none in N ms
++//	POST /hostreply?id=N   body: the host's answer
++//	POST /emit?name=X      body: JSON array, for Go-side EventsOn listeners
++//	POST /beforeclose      "1" when leaving should be refused, else "0"
++//
++// Lifetime: the parent holds the write end of our stdin. When the app process
++// dies, for whatever reason, stdin reaches EOF and the core exits with it, so
++// no orphan keeps polling speakers.
++
++import (
++	"context"
++	"crypto/subtle"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"net/http"
++	"os"
++	"strconv"
++	"time"
++
++	"github.com/wailsapp/wails/v2/pkg/mobile"
++	"github.com/wailsapp/wails/v2/pkg/options"
++)
++
++const maxBody = 32 << 20 // a backup or a station list, never more
++
++func runProcessMode(o *options.App) error {
++	token := os.Getenv("STR_BRIDGE_TOKEN")
++	if len(token) < 32 {
++		return errors.New("process mode needs STR_BRIDGE_TOKEN (at least 32 characters) from the Android host")
++	}
++	addr := os.Getenv("STR_BRIDGE_ADDR")
++	if addr == "" {
++		addr = "127.0.0.1:0"
++	}
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil || (host != "127.0.0.1" && host != "::1" && host != "localhost") {
++		return fmt.Errorf("process mode only listens on loopback, not %q", addr)
++	}
++	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
++		mobile.SetCacheDir(d)
++	}
++	log.SetFlags(0)
++	log.SetOutput(os.Stderr)
++
++	go func() {
++		_, _ = io.Copy(io.Discard, os.Stdin)
++		log.Print("STR core: host went away, exiting")
++		os.Exit(0)
++	}()
++
++	for _, b := range o.Bind {
++		mobile.Bind(b)
++	}
++	ctx := context.Background()
++
++	auth := func(h http.HandlerFunc) http.HandlerFunc {
++		return func(w http.ResponseWriter, r *http.Request) {
++			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-STR-Token")), []byte(token)) != 1 {
++				http.Error(w, "forbidden", http.StatusForbidden)
++				return
++			}
++			r.Body = http.MaxBytesReader(w, r.Body, maxBody)
++			h(w, r)
++		}
++	}
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("/call", auth(func(w http.ResponseWriter, r *http.Request) {
++		var req struct {
++			Method string          `json:"method"`
++			Args   json.RawMessage `json:"args"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write(mobile.Call(req.Method, string(req.Args)))
++	}))
++	mux.HandleFunc("/next", auth(func(w http.ResponseWriter, r *http.Request) {
++		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
++		if ms <= 0 || ms > 30000 {
++			ms = 1000
++		}
++		b := mobile.NextEvent(time.Duration(ms) * time.Millisecond)
++		if b == nil {
++			w.WriteHeader(http.StatusNoContent)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write(b)
++	}))
++	mux.HandleFunc("/hostreply", auth(func(w http.ResponseWriter, r *http.Request) {
++		id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
++		if err != nil {
++			http.Error(w, "bad id", http.StatusBadRequest)
++			return
++		}
++		b, _ := io.ReadAll(r.Body)
++		mobile.HostReply(id, b)
++	}))
++	mux.HandleFunc("/emit", auth(func(w http.ResponseWriter, r *http.Request) {
++		b, _ := io.ReadAll(r.Body)
++		mobile.Dispatch(r.URL.Query().Get("name"), string(b))
++	}))
++	mux.HandleFunc("/beforeclose", auth(func(w http.ResponseWriter, r *http.Request) {
++		prevent := o.OnBeforeClose != nil && o.OnBeforeClose(ctx)
++		if prevent {
++			_, _ = io.WriteString(w, "1")
++		} else {
++			_, _ = io.WriteString(w, "0")
++		}
++	}))
++
++	ln, err := net.Listen("tcp", addr)
++	if err != nil {
++		return err
++	}
++	// The host reads this line from our stdout to learn the port.
++	fmt.Printf("STR_BRIDGE_LISTENING %s\n", ln.Addr())
++	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
++	errCh := make(chan error, 1)
++	go func() { errCh <- srv.Serve(ln) }()
++
++	// Bound calls may arrive before startup finishes; the desktop app is
++	// written for that (App.appCtx), as Wails dispatches the same way.
++	if o.OnStartup != nil {
++		o.OnStartup(ctx)
++	}
++	return <-errCh
++}
+diff --git a/android/wailsshim/wails.go b/android/wailsshim/wails.go
+index afd39420..b2f560a1 100644
+--- a/android/wailsshim/wails.go
++++ b/android/wailsshim/wails.go
+@@ -1,8 +1,14 @@
+ // Package wails is the Android stand-in for github.com/wailsapp/wails/v2.
+ //
+-// On Android, Run is never reached: the app is built as a shared library whose
+-// main() the platform never calls, and desktop-app/mobile_android.go starts
+-// the app instead.
++// Run has three roles, depending on how the core was built:
++//
++//   - Android shared library (-buildmode=c-shared, the Gradle build): never
++//     reached; main() is not called and desktop-app/mobile_android.go starts
++//     the app over JNI.
++//   - Android executable (process mode, android/build-apk.sh): the Android
++//     app launches the core as a child process and Run serves the bridge on a
++//     private loopback port (see process.go). No NDK is needed for this build.
++//   - Desktop OS: a browser dev harness, below.
+ //
+ // On a desktop OS, Run turns the Android build of the core into a browser dev
+ // harness. `go run -modfile=go.android.mod .` in desktop-app serves the
+@@ -36,10 +42,10 @@ import (
+ //go:embed devhost.js
+ var devHostJS []byte
+ 
+-// Run starts the browser dev harness (desktop OS only).
++// Run starts the process-mode bridge on Android, the dev harness elsewhere.
+ func Run(o *options.App) error {
+-	if runtime.GOOS == "android" {
+-		return errors.New("wails.Run is not available on Android; the app is started by the Android host")
++	if runtime.GOOS == "android" || os.Getenv("STR_HOST_MODE") == "process" {
++		return runProcessMode(o)
+ 	}
+ 	for _, b := range o.Bind {
+ 		mobile.Bind(b)
+-- 
+2.43.0
+

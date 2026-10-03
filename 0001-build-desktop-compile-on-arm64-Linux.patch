@@ -1,0 +1,49 @@
+From 10f58141fb4689743e38bb4443969fed6ff6246d Mon Sep 17 00:00:00 2001
+From: Joel Brower <joel.brower@gmail.com>
+Date: Sat, 3 Oct 2026 00:22:38 -0500
+Subject: [PATCH 1/6] build(desktop): compile on arm64 Linux
+
+syscall.Dup2 does not exist on linux/arm64 (the kernel only has dup3 there),
+so the desktop app failed to compile for an ARM Linux desktop and for
+Android. Use unix.Dup2 from golang.org/x/sys, which maps onto dup3 where
+needed. Behaviour on the shipped platforms is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016wzfhQtsFu3EKKkUkehQyh
+---
+ desktop-app/crashlog_unix.go | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/desktop-app/crashlog_unix.go b/desktop-app/crashlog_unix.go
+index f72a2cdb..1211fee4 100644
+--- a/desktop-app/crashlog_unix.go
++++ b/desktop-app/crashlog_unix.go
+@@ -4,18 +4,23 @@ package main
+ 
+ import (
+ 	"os"
+-	"syscall"
++
++	"golang.org/x/sys/unix"
+ )
+ 
+ // redirectStderrTo points the process's stderr (fd 2) at f so the Go
+ // runtime's crash traceback, which it writes to fd 2 on an unrecovered
+ // panic or a fatal runtime error, lands in the log file. Best-effort;
+ // see newFileLogger for why this is only done in production builds.
++//
++// unix.Dup2 rather than syscall.Dup2: linux/arm64 (and android/arm64) has no
++// dup2 system call, so syscall.Dup2 does not exist there and the package did
++// not compile for an ARM Linux desktop or for Android. x/sys maps it onto dup3.
+ func redirectStderrTo(f *os.File) {
+ 	if f == nil {
+ 		return
+ 	}
+-	if err := syscall.Dup2(int(f.Fd()), int(os.Stderr.Fd())); err == nil {
++	if err := unix.Dup2(int(f.Fd()), int(os.Stderr.Fd())); err == nil {
+ 		os.Stderr = f
+ 	}
+ }
+-- 
+2.43.0
+
